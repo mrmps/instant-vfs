@@ -70,6 +70,12 @@ const SECURITY_HEADERS: Record<string, string> = {
   "strict-transport-security": "max-age=31536000; includeSubDomains",
 };
 
+// Every 4xx/5xx error body gets these links. Agents (and humans) hitting an
+// unknown endpoint get a direct pointer to the full documentation without
+// having to guess the base URL.
+const DOCS_URL = "https://gitvfs.miryaboy.workers.dev/";
+const LLMS_TXT_URL = "https://gitvfs.miryaboy.workers.dev/llms.txt";
+
 function json(data: unknown, status = 200, extra: HeadersInit = {}) {
   const base: Record<string, string> = {
     "content-type": "application/json; charset=utf-8",
@@ -103,7 +109,10 @@ function err(
   extra: Record<string, unknown> = {},
   headers: HeadersInit = {},
 ) {
-  return json({ error: code, message, ...extra }, status, headers);
+  return json(
+    { error: code, message, ...extra, docs: DOCS_URL, llms_txt: LLMS_TXT_URL },
+    status, headers,
+  );
 }
 
 // 429 with retry-after — unified for throttle + upstream rate-limits.
@@ -129,7 +138,9 @@ function badPath(got: string, message?: string) {
       expected: "/:owner/:repo[@:ref]/<action>[/<path>]",
       example: "/facebook/react/tree   or   /honojs/hono/grep?q=middleware",
       got,
-      actions: ["tree", "tree.json", "file", "stat", "outline", "grep", "head", "status"],
+      actions: ["tree", "tree.json", "file", "stat", "outline", "grep", "head", "status", "bash", "files"],
+      docs: DOCS_URL,
+      llms_txt: LLMS_TXT_URL,
     },
     400,
   );
@@ -837,7 +848,7 @@ async function handle(
       if (!file) {
         const suggestions = await stub.suggestPaths(path);
         return json(
-          { error: "not_found", path, suggestions },
+          { error: "not_found", path, suggestions, docs: DOCS_URL, llms_txt: LLMS_TXT_URL },
           404,
           metaHeaders,
         );
@@ -957,7 +968,7 @@ async function handle(
       const path = rest.slice(1).join("/");
       if (!path) return err("missing_path", "Missing file path.", 400);
       const s = await stub.stat(path);
-      if (!s) return json({ error: "not_found", path }, 404, metaHeaders);
+      if (!s) return json({ error: "not_found", path, docs: DOCS_URL, llms_txt: LLMS_TXT_URL }, 404, metaHeaders);
       return finalize(json({ sha, ...s }, 200, metaHeaders));
     }
 
@@ -999,7 +1010,11 @@ async function handle(
           ));
         }
         const suggestions = await stub.suggestPaths(path);
-        return json({ error: "not_found", path, suggestions }, 404, metaHeaders);
+        return json(
+          { error: "not_found", path, suggestions, docs: DOCS_URL, llms_txt: LLMS_TXT_URL },
+          404,
+          metaHeaders,
+        );
       }
 
       const decoder = new TextDecoder("utf-8", { fatal: false });
