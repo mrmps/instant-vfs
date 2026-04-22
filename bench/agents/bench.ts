@@ -14,22 +14,38 @@
 // produced each data point.
 //
 // Usage:
+//   # Anthropic (default)
 //   ANTHROPIC_API_KEY=sk-ant-... bun bench/agents/bench.ts
 //   ANTHROPIC_API_KEY=sk-ant-... bun bench/agents/bench.ts --task T03 --trials 3
-//   ANTHROPIC_API_KEY=sk-ant-... bun bench/agents/bench.ts --condition gitvfs
 //   ANTHROPIC_API_KEY=sk-ant-... bun bench/agents/bench.ts --note "AS-004..008 deploy"
+//
+//   # OpenRouter — uses OpenRouter's Anthropic-compatible /v1/messages endpoint,
+//   # so the Anthropic SDK just works against any OR-hosted model that supports
+//   # tool use. Cost comes directly from OR's reported usage.cost when present.
+//   OPENROUTER_API_KEY=sk-or-... bun bench/agents/bench.ts \
+//     --provider openrouter --model minimax/minimax-m2.5
 
 import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, writeFileSync, mkdirSync, appendFileSync, createWriteStream } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const MODEL = "claude-sonnet-4-5";
-// Sonnet 4.5 pricing (USD per 1M tokens). Adjust if you change the model.
-const PRICE_INPUT = 3.0;
-const PRICE_OUTPUT = 15.0;
-const PRICE_CACHE_WRITE = 3.75;
-const PRICE_CACHE_READ = 0.30;
+type Provider = "anthropic" | "openrouter";
+
+// USD per 1M tokens. Used when the upstream response doesn't include
+// usage.cost (Anthropic never does; OpenRouter does). Models without
+// an entry fall back to conservative Anthropic-class pricing.
+const PRICING: Record<string, {
+  input: number; output: number; cacheWrite?: number; cacheRead?: number;
+}> = {
+  "claude-sonnet-4-5":     { input: 3.0,  output: 15.0, cacheWrite: 3.75, cacheRead: 0.30 },
+  "claude-haiku-4-5":      { input: 0.8,  output: 4.0,  cacheWrite: 1.0,  cacheRead: 0.08 },
+  "minimax/minimax-m2.5":  { input: 0.30, output: 1.20, cacheRead: 0.075 },
+};
+
+function priceFor(model: string) {
+  return PRICING[model] ?? { input: 3.0, output: 15.0, cacheWrite: 3.75, cacheRead: 0.30 };
+}
 
 const MAX_TOOL_ITERS = 12;
 const MAX_RESP_BYTES = 50_000;
@@ -113,11 +129,23 @@ type TraceEvent = {
   elapsedMs: number;
 };
 
+// If we have GITVFS_INTERNAL_KEY set, pass it on gitvfs requests so that
+// the per-IP rate limits don't trip when bench fans out concurrently.
+// (The per-SHA throttle still applies, but that's cheap.)
+const GITVFS_KEY = process.env.GITVFS_INTERNAL_KEY ?? null;
+function headersFor(url: string): Record<string, string> {
+  const h: Record<string, string> = { "user-agent": "gitvfs-bench/0.3" };
+  if (GITVFS_KEY && url.includes("gitvfs.miryaboy.workers.dev")) {
+    h["x-gitvfs-key"] = GITVFS_KEY;
+  }
+  return h;
+}
+
 async function httpGet(url: string): Promise<{ agentView: string; trace: Omit<TraceEvent, "t"> }> {
   const t0 = Date.now();
   try {
     const res = await fetch(url, {
-      headers: { "user-agent": "gitvfs-bench/0.2" },
+      headers: headersFor(url),
       redirect: "follow",
     });
     const raw = await res.arrayBuffer();
@@ -191,6 +219,7 @@ type RunSummary = {
   runId: string;              // <benchRunId>-<taskId>-<condition>-<trial>
   benchRunId: string;         // shared across all runs in a single bench invocation
   ts: string;                 // ISO start time of this run
+  provider: Provider;
   model: string;
   workerCommit: string;       // git HEAD of instant-vfs at bench-time
   workerDirty: boolean;       // uncommitted changes when bench ran
@@ -214,19 +243,21 @@ type RunSummary = {
   cacheWriteTokens: number;
   cacheReadTokens: number;
   costUsd: number;
+  costSource: "upstream" | "computed";  // did we use resp.usage.cost or table?
 
   traceFile: string;          // relative path: traces/<runId>.jsonl
 };
 
-function cost(u: {
+function cost(model: string, u: {
   inputTokens: number; outputTokens: number;
   cacheWriteTokens: number; cacheReadTokens: number;
 }): number {
+  const p = priceFor(model);
   return (
-    (u.inputTokens * PRICE_INPUT) / 1e6 +
-    (u.outputTokens * PRICE_OUTPUT) / 1e6 +
-    (u.cacheWriteTokens * PRICE_CACHE_WRITE) / 1e6 +
-    (u.cacheReadTokens * PRICE_CACHE_READ) / 1e6
+    (u.inputTokens * p.input) / 1e6 +
+    (u.outputTokens * p.output) / 1e6 +
+    (u.cacheWriteTokens * (p.cacheWrite ?? p.input)) / 1e6 +
+    (u.cacheReadTokens * (p.cacheRead ?? p.input * 0.1)) / 1e6
   );
 }
 
@@ -235,6 +266,8 @@ type RunContext = {
   condition: "baseline" | "gitvfs";
   trial: number;
   benchRunId: string;
+  provider: Provider;
+  model: string;
   workerCommit: string;
   workerDirty: boolean;
   note: string | null;
@@ -276,6 +309,8 @@ async function runOne(client: Anthropic, ctx: RunContext): Promise<RunSummary> {
 
   let toolCalls = 0;
   let inputTokens = 0, outputTokens = 0, cacheWriteTokens = 0, cacheReadTokens = 0;
+  let upstreamCostUsd = 0;
+  let upstreamCostSeen = false;
   let answer = "";
   let stopReason: string | null = null;
   const t0 = Date.now();
@@ -284,7 +319,7 @@ async function runOne(client: Anthropic, ctx: RunContext): Promise<RunSummary> {
   try {
     for (; iters < MAX_TOOL_ITERS; iters++) {
       const resp = await client.messages.create({
-        model: MODEL,
+        model: ctx.model,
         max_tokens: 2048,
         system: [{
           type: "text",
@@ -299,6 +334,12 @@ async function runOne(client: Anthropic, ctx: RunContext): Promise<RunSummary> {
       outputTokens += resp.usage.output_tokens ?? 0;
       cacheWriteTokens += (resp.usage as any).cache_creation_input_tokens ?? 0;
       cacheReadTokens += (resp.usage as any).cache_read_input_tokens ?? 0;
+      // OpenRouter surfaces an authoritative cost; prefer it when present.
+      const upstreamCost = (resp.usage as any).cost;
+      if (typeof upstreamCost === "number" && Number.isFinite(upstreamCost)) {
+        upstreamCostUsd += upstreamCost;
+        upstreamCostSeen = true;
+      }
       stopReason = resp.stop_reason;
 
       messages.push({ role: "assistant", content: resp.content });
@@ -350,11 +391,16 @@ async function runOne(client: Anthropic, ctx: RunContext): Promise<RunSummary> {
 
   const passed = parsed ? grade(parsed, task.expected) : false;
 
+  const costUsd = upstreamCostSeen
+    ? upstreamCostUsd
+    : cost(ctx.model, { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens });
+
   return {
     runId,
     benchRunId: ctx.benchRunId,
     ts: new Date(t0).toISOString(),
-    model: MODEL,
+    provider: ctx.provider,
+    model: ctx.model,
     workerCommit: ctx.workerCommit,
     workerDirty: ctx.workerDirty,
     note: ctx.note,
@@ -369,7 +415,8 @@ async function runOne(client: Anthropic, ctx: RunContext): Promise<RunSummary> {
     wallClockMs,
     stopReason,
     inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens,
-    costUsd: cost({ inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens }),
+    costUsd,
+    costSource: upstreamCostSeen ? "upstream" : "computed",
     traceFile,
   };
 }
@@ -402,7 +449,8 @@ function markdownReport(rows: RunSummary[], tasks: Task[]): string {
   const g = agg(rows.filter((r) => r.condition === "gitvfs"))!;
 
   let out = `# gitvfs-bench results\n\n`;
-  out += `Model: \`${rows[0]?.model ?? MODEL}\`  \n`;
+  out += `Provider: \`${rows[0]?.provider ?? "?"}\`  \n`;
+  out += `Model: \`${rows[0]?.model ?? "?"}\`  \n`;
   out += `Worker commit: \`${rows[0]?.workerCommit ?? "?"}\`${rows[0]?.workerDirty ? " (dirty)" : ""}  \n`;
   if (rows[0]?.note) out += `Note: ${rows[0].note}  \n`;
   out += `Tasks: ${tasks.length}  \n`;
@@ -463,13 +511,37 @@ async function main() {
     ? [condArg as "baseline" | "gitvfs"]
     : ["baseline", "gitvfs"];
   const note = argOf("--note");
+  const provider = (argOf("--provider") ?? "anthropic") as Provider;
+  // Model default by provider; caller can always override with --model.
+  const defaultModel =
+    provider === "openrouter" ? "minimax/minimax-m2.5" : "claude-sonnet-4-5";
+  const model = argOf("--model") ?? defaultModel;
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error("ANTHROPIC_API_KEY not set");
-    process.exit(1);
+  let client: Anthropic;
+  if (provider === "openrouter") {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      console.error("OPENROUTER_API_KEY not set");
+      process.exit(1);
+    }
+    // OpenRouter's /api/v1/messages speaks the Anthropic Messages API.
+    // Pass baseURL so the SDK dispatches there instead of api.anthropic.com.
+    client = new Anthropic({
+      apiKey,
+      baseURL: "https://openrouter.ai/api",
+      defaultHeaders: {
+        "http-referer": "https://gitvfs.miryaboy.workers.dev",
+        "x-title": "gitvfs-bench",
+      },
+    });
+  } else {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      console.error("ANTHROPIC_API_KEY not set");
+      process.exit(1);
+    }
+    client = new Anthropic({ apiKey });
   }
-  const client = new Anthropic({ apiKey });
 
   let tasks = loadTasks();
   if (taskFilter) tasks = tasks.filter((t) => t.id === taskFilter);
@@ -485,56 +557,101 @@ async function main() {
   const benchRunId = new Date().toISOString().replace(/[:.]/g, "-").replace(/Z$/, "");
 
   process.stderr.write(
-    `bench run ${benchRunId}  worker=${workerCommit.slice(0, 7)}${workerDirty ? "+dirty" : ""}` +
+    `bench run ${benchRunId}  provider=${provider}  model=${model}  worker=${workerCommit.slice(0, 7)}${workerDirty ? "+dirty" : ""}` +
     (note ? `  note="${note}"` : "") + "\n",
   );
 
-  const rows: RunSummary[] = [];
-  const totalRuns = tasks.length * conds.length * trials;
-  let done = 0;
+  // Build job queue upfront; a worker pool consumes it concurrently.
+  // Default concurrency matches the job count — i.e. full fan-out. Agent
+  // calls are independent and network-bound, so this cuts a 20-job run from
+  // many minutes down to one agent's wall-clock.
+  //
+  // If we have GITVFS_INTERNAL_KEY set, we send it as x-gitvfs-key on every
+  // request to the deployed worker, which bypasses the per-IP rate limiter.
+  // Without that key, Cloudflare's RL_EXPENSIVE would 429 the grep calls
+  // once we fan out past ~3-4 concurrent. Use --concurrency N to override.
+  //
+  // Caveat: concurrent runs compete for network, so individual wallClockMs
+  // numbers get ~10-20% noisier. For paired comparisons (baseline vs gitvfs
+  // under the same contention) the delta is still meaningful — just don't
+  // treat absolute ms as high-precision.
+  const requestedConc = argOf("--concurrency");
 
+  type Job = { task: Task; condition: "baseline" | "gitvfs"; trial: number };
+  const jobs: Job[] = [];
   for (const task of tasks) {
     for (const condition of conds) {
       for (let trial = 0; trial < trials; trial++) {
-        done++;
-        process.stderr.write(`[${done}/${totalRuns}] ${task.id} ${condition} #${trial + 1}...`);
-        const t0 = Date.now();
-        try {
-          const r = await runOne(client, {
-            task, condition, trial,
-            benchRunId, workerCommit, workerDirty, note,
-            resultsDir,
-          });
-          rows.push(r);
-          appendFileSync(runsJsonl, JSON.stringify(r) + "\n");
-          process.stderr.write(
-            ` ${r.passed ? "PASS" : "FAIL"} (${r.toolCalls} calls, ${fmtMs(r.wallClockMs)}, ${fmtUsd(r.costUsd)})\n`,
-          );
-        } catch (e: any) {
-          process.stderr.write(` ERROR ${e.message}\n`);
-          const stub: RunSummary = {
-            runId: `${benchRunId}-${task.id}-${condition}-${trial}`,
-            benchRunId,
-            ts: new Date(t0).toISOString(),
-            model: MODEL,
-            workerCommit, workerDirty, note,
-            taskId: task.id, condition, trial,
-            category: task.category,
-            passed: false,
-            answer: `ERROR: ${e.message}`,
-            toolCalls: 0, iterations: 0,
-            wallClockMs: Date.now() - t0,
-            stopReason: "error",
-            inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0,
-            costUsd: 0,
-            traceFile: join("traces", `${benchRunId}-${task.id}-${condition}-${trial}.jsonl`),
-          };
-          rows.push(stub);
-          appendFileSync(runsJsonl, JSON.stringify(stub) + "\n");
-        }
+        jobs.push({ task, condition, trial });
       }
     }
   }
+
+  const concurrency = requestedConc
+    ? Math.max(1, Number(requestedConc))
+    : jobs.length;
+
+  const rows: RunSummary[] = [];
+  let done = 0;
+  let cursor = 0;
+  process.stderr.write(
+    `pool concurrency=${concurrency}, jobs=${jobs.length}, ` +
+    `gitvfs-bypass=${GITVFS_KEY ? "on" : "off"}\n`,
+  );
+
+  const workerLoop = async (workerIdx: number) => {
+    while (true) {
+      const i = cursor++;
+      if (i >= jobs.length) return;
+      const { task, condition, trial } = jobs[i];
+      const t0 = Date.now();
+      process.stderr.write(`  → [w${workerIdx}] ${task.id} ${condition} #${trial + 1} starting\n`);
+      try {
+        const r = await runOne(client, {
+          task, condition, trial,
+          benchRunId, provider, model,
+          workerCommit, workerDirty, note,
+          resultsDir,
+        });
+        rows.push(r);
+        appendFileSync(runsJsonl, JSON.stringify(r) + "\n");
+        done++;
+        process.stderr.write(
+          `  ✓ [${done}/${jobs.length}] ${task.id} ${condition} ${r.passed ? "PASS" : "FAIL"} ` +
+          `(${r.toolCalls} calls, ${fmtMs(r.wallClockMs)}, ${fmtUsd(r.costUsd)})\n`,
+        );
+      } catch (e: any) {
+        const stub: RunSummary = {
+          runId: `${benchRunId}-${task.id}-${condition}-${trial}`,
+          benchRunId,
+          ts: new Date(t0).toISOString(),
+          provider, model,
+          workerCommit, workerDirty, note,
+          taskId: task.id, condition, trial,
+          category: task.category,
+          passed: false,
+          answer: `ERROR: ${e.message}`,
+          toolCalls: 0, iterations: 0,
+          wallClockMs: Date.now() - t0,
+          stopReason: "error",
+          inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0,
+          costUsd: 0,
+          costSource: "computed",
+          traceFile: join("traces", `${benchRunId}-${task.id}-${condition}-${trial}.jsonl`),
+        };
+        rows.push(stub);
+        appendFileSync(runsJsonl, JSON.stringify(stub) + "\n");
+        done++;
+        process.stderr.write(
+          `  ✗ [${done}/${jobs.length}] ${task.id} ${condition} ERROR ${e.message}\n`,
+        );
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, jobs.length) }, (_, i) => workerLoop(i + 1)),
+  );
 
   const md = markdownReport(rows, tasks);
   const reportPath = join(resultsDir, `${benchRunId}-report.md`);
