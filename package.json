@@ -11,6 +11,7 @@
     "tar-stream": "^3.1.7"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.90.0",
     "@types/bun": "^1.1.0",
     "@types/tar-stream": "^3.1.3",
     "typescript": "^5.5.0",
