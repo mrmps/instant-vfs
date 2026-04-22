@@ -258,7 +258,8 @@ describe("Story 11: warm-read performance budget", () => {
     const durations: number[] = [];
     for (let i = 0; i < 5; i++) {
       const t0 = performance.now();
-      const r = await getRaw(`/${HONO}/tree?x=${i}`); // unique URL each time to bypass edge cache
+      const r = await getRaw(`/${HONO}/tree`); // getRaw appends _cb= to bypass edge cache
+      expect(r.status).toBe(200);
       await r.text();
       durations.push(performance.now() - t0);
     }
@@ -269,7 +270,8 @@ describe("Story 11: warm-read performance budget", () => {
 
   test("edge-cached warm reads stay under 500ms", async () => {
     // Hit same URL (bust: false) so the edge cache can actually hit.
-    const url = `/${HONO}/tree?stable=${Date.now()}`;
+    // _stable is reserved (underscore-prefixed) so the allowlist accepts it.
+    const url = `/${HONO}/tree?_stable=${Date.now()}`;
     await getRaw(url, {}, { bust: false }); // prime
     await new Promise((r) => setTimeout(r, 1000)); // let waitUntil finish cache.put
     const durations: number[] = [];

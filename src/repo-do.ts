@@ -562,6 +562,7 @@ export class RepoDO extends DurableObject<Env> {
   }): Promise<{
     truncated: boolean;
     filesScanned: number;
+    matchedFiles: number;
     matches: { path: string; line: number; text: string; before?: string[]; after?: string[] }[];
     files?: string[];
   }> {
@@ -658,11 +659,15 @@ export class RepoDO extends DurableObject<Env> {
       return {
         truncated,
         filesScanned,
+        matchedFiles: fileSet.size,
         matches: [],
         files: [...fileSet].sort(),
       };
     }
-    return { truncated, filesScanned, matches: out };
+    // Count distinct paths with >= 1 match for the full-match shape.
+    const matchedPaths = new Set<string>();
+    for (const m of out) matchedPaths.add(m.path);
+    return { truncated, filesScanned, matchedFiles: matchedPaths.size, matches: out };
   }
 
   /**

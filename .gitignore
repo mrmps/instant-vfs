@@ -6,3 +6,7 @@ dist
 bench/results/*
 !bench/results/baseline.json
 
+# Agent bench outputs: we WANT `bench/agents/results/runs.jsonl` and
+# `bench/agents/results/traces/` and `*-report.md` under git so bench
+# history diffs as a first-class artifact. No exclusions needed here.
+

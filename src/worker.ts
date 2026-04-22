@@ -127,6 +127,42 @@ function throttled(
   });
 }
 
+// Read & validate `?path=` query parameter. Agents reach for this by analogy
+// with `grep pattern path/`, `find path/`, `ls path/`, `tree path/`. Prior
+// versions swallowed the param; the 30-agent study showed ~20/28 agents tried
+// it. Return `{ path }` on valid input, an error Response on rejection, or
+// `null` when absent.
+function readPathParam(url: URL): { path: string } | Response | null {
+  const raw = url.searchParams.get("path");
+  if (raw === null) return null;
+  if (raw === "") {
+    return json({
+      error: "bad_path_param",
+      message: "?path= cannot be empty.",
+      hint: "Pass a file or directory path under the repo, e.g. ?path=src/index.ts",
+    }, 400);
+  }
+  // Normalize leading/trailing slashes. Reject traversal and obviously-bogus input.
+  const normalized = raw.replace(/^\/+|\/+$/g, "");
+  if (!normalized || normalized.length > MAX_PATH_LENGTH) {
+    return json({
+      error: "bad_path_param",
+      message: "?path= is empty after normalization or too long.",
+      got: raw,
+    }, 400);
+  }
+  for (const seg of normalized.split("/")) {
+    if (seg === "" || seg === "." || seg === "..") {
+      return json({
+        error: "bad_path_param",
+        message: "?path= contains invalid segment (empty / '.' / '..').",
+        got: raw,
+      }, 400);
+    }
+  }
+  return { path: normalized };
+}
+
 // Hint-rich bad_path response. Every 30-agent trace showed that the default
 // `bad_path` error burns 2–3 calls while the agent guesses URL shapes.
 // Embedding expected/example/got makes the error self-correcting.
@@ -155,7 +191,7 @@ interface ParsedRepo {
 
 const ACTIONS = new Set([
   "tree", "tree.json", "file", "files", "stat", "grep", "status",
-  "outline", "count", "head", "bash",
+  "outline", "symbol", "count", "head", "bash",
 ]);
 
 // Validate a file path coming from user input (query params).
@@ -236,20 +272,25 @@ Use curl or any raw HTTP client. Do NOT use summarizing fetchers — they will
 paraphrase source code instead of returning it. Every response carries
 x-gitvfs-sha / x-gitvfs-ref / x-gitvfs-resolved-at headers for freshness.
 
-Prefer structured endpoints for exploration: /outline (+ ?depth=2&comments=1),
-/file?lines=A-B for slices, /grep for search, /files for batched reads.
+Prefer structured endpoints for exploration:
+- For "what line is symbol X on?" / "where is foo defined?" → /outline or /symbol
+  (they return line numbers directly; do NOT slice /file and count newlines).
+- For file contents → /file?lines=A-B&numbered=1 (numbers prefixed per line).
+- For search → /grep (add ?symbols=1 to get enclosing function/class names).
+- For batched reads → /files.
 /bash is an escape hatch for ad-hoc multi-step shell pipelines.
 
 ## Endpoints
 
 - GET /tree[/<path>]?glob=&sizes=1&depth=1&count=1          newline paths
 - GET /tree.json[/<path>]?outlines=1                         structured listing
-- GET /file/<path>?lines=A-B                                 raw bytes (+ slicing)
-- GET /files?paths=a&paths=b&format=ndjson                   batched reads
-- GET /stat/<path>                                           {size, mime, lines, language}
 - GET /outline/<path>?depth=2&comments=1                     symbols + endLine + JSDoc
 - GET /outline/<dir>                                         bulk outline for every file under it
-- GET /grep?q=<pat>&glob=&exclude_glob=&regex=1&files_only=1 ripgrep-like
+- GET /symbol/<path>?name=<sym>                              one symbol's line / endLine / signature
+- GET /grep?q=<pat>&glob=&exclude_glob=&regex=1&files_only=1&symbols=1 ripgrep-like
+- GET /file/<path>?lines=A-B&numbered=1                      raw bytes (slicing + optional N | prefix)
+- GET /files?paths=a&paths=b&format=ndjson                   batched reads
+- GET /stat/<path>                                           {size, mime, lines, language}
 - GET /bash?cmd=<script>&format=text                         read-only shell
 - GET /head                                                  freshness probe, no ingest
 - GET /status                                                ingest state
@@ -554,6 +595,23 @@ async function handle(
     if (!parsed) return badPath(pathname + (url.search || ""));
     const { owner, repo, ref, rest } = parsed;
 
+    // AS-009: a `$` in a ref is never a valid git ref — it's almost always a
+    // bash variable that didn't get substituted before the URL left the shell
+    // (e.g. `curl ".../repo@$PI/..."` pasted into a tool where `PI` isn't set).
+    // GitHub returns 422 on the lookup, which we'd otherwise surface as a
+    // generic 404 `ref_not_found` — useless to anyone debugging.
+    if (ref && /\$/.test(ref)) {
+      return err(
+        "unexpanded_shell_variable",
+        `Ref '${ref}' contains '$', which git refs never do — looks like an unexpanded shell variable.`,
+        400,
+        {
+          ref,
+          hint: `Use the literal SHA (e.g. @<40-char-sha>), omit @<ref> entirely to use HEAD, or set the variable before substitution (e.g. \`SHA=abc123 curl "${pathname.replace(ref, "$SHA")}"\`).`,
+        },
+      );
+    }
+
     const forceRefresh = url.searchParams.get("refresh") === "1";
 
     // Resolve ref → SHA. Only a full 40-char SHA is trusted as-is.
@@ -743,19 +801,59 @@ async function handle(
     // tree / tree.json
     // -----------------------------------------------------------------
     if (action === "tree" || action === "tree.json") {
+      // AS-001: reject unknown query params instead of silently ignoring them.
+      // Underscore-prefixed params are reserved for client-side cache-busting
+      // (see test/common.ts `_cb=`).
+      const TREE_PARAMS = new Set([
+        "glob", "path", "sizes", "outlines", "count", "depth", "refresh",
+      ]);
+      for (const key of url.searchParams.keys()) {
+        if (key.startsWith("_")) continue;
+        if (!TREE_PARAMS.has(key)) {
+          return err(
+            "unknown_query_param",
+            `Unknown query param '${key}' on /${action}. Known: ${[...TREE_PARAMS].sort().join(", ")}.`,
+            400,
+            { param: key, hint: "Did you mean /tree/<subpath> or ?path=<subpath>?" },
+          );
+        }
+      }
       const rawGlob = url.searchParams.get("glob");
       if (rawGlob === "") return err("bad_glob", "Empty glob.", 400);
       const glob = rawGlob ? normalizeGlob(rawGlob) : undefined;
-      const prefix = rest.slice(1).join("/") || undefined;
+      // `prefix` may come from the URL segment (`/tree/src`) OR from the
+      // query param (`?path=src`). They are mutually exclusive; ?path= is
+      // accepted because agents reach for it by analogy with bash tree/ls/find.
+      let prefix = rest.slice(1).join("/") || undefined;
+      const pathParam = readPathParam(url);
+      if (pathParam instanceof Response) return pathParam;
+      if (pathParam) {
+        if (prefix) {
+          return err(
+            "conflicting_path",
+            "Use /tree/<subpath> OR ?path=<subpath>, not both.",
+            400,
+            { urlPath: prefix, queryPath: pathParam.path },
+          );
+        }
+        prefix = pathParam.path;
+      }
       const withSizes = url.searchParams.get("sizes") === "1";
       const withOutlines = url.searchParams.get("outlines") === "1";
       const countOnly = url.searchParams.get("count") === "1";
       const depthParam = url.searchParams.get("depth");
 
+      // AS-002: helper for per-response entry-count header on /tree responses.
+      const withCountHeader = (n: number): Record<string, string> => ({
+        ...metaHeaders,
+        "x-gitvfs-entries": String(n),
+      });
+
       if (countOnly) {
         const n = await stub.treeCount({ glob, prefix });
-        if (action === "tree.json") return finalize(json({ sha, count: n }, 200, metaHeaders));
-        return finalize(text(String(n) + "\n", 200, metaHeaders));
+        const h = withCountHeader(n);
+        if (action === "tree.json") return finalize(json({ sha, count: n }, 200, h));
+        return finalize(text(String(n) + "\n", 200, h));
       }
 
       // One-level listing — the `ls` analogue. Synthesizes directory entries
@@ -765,8 +863,9 @@ async function handle(
         if (glob) return err("bad_params", "?depth=1 cannot combine with ?glob (it is already scoped).", 400);
         if (withOutlines) return err("bad_params", "?depth=1 cannot combine with ?outlines.", 400);
         const entries = await stub.treeLevel(prefix !== undefined ? { prefix } : {});
+        const h = withCountHeader(entries.length);
         if (action === "tree.json") {
-          return finalize(json({ sha, count: entries.length, entries }, 200, metaHeaders));
+          return finalize(json({ sha, count: entries.length, entries }, 200, h));
         }
         const body = entries.map((e) => {
           const name = e.path.split("/").pop() ?? e.path;
@@ -775,7 +874,7 @@ async function handle(
           const lines = e.lines !== undefined ? String(e.lines) : "-";
           return `${name}\t${e.size ?? 0}\t${lines}`;
         }).join("\n");
-        return finalize(text(body + (entries.length ? "\n" : ""), 200, metaHeaders));
+        return finalize(text(body + (entries.length ? "\n" : ""), 200, h));
       }
 
       // Tree with per-file outlines: planning view in one request.
@@ -789,7 +888,7 @@ async function handle(
           );
         }
         const { entries, truncated } = await stub.treeWithOutlines({ glob, prefix });
-        const outlineHeaders: Record<string, string> = { ...metaHeaders };
+        const outlineHeaders: Record<string, string> = withCountHeader(entries.length);
         if (truncated) outlineHeaders["x-gitvfs-truncated"] = "true";
         return finalize(json(
           { sha, count: entries.length, truncated, entries },
@@ -799,6 +898,7 @@ async function handle(
       }
 
       const entries = await stub.tree({ glob, prefix, withSizes });
+      const h = withCountHeader(entries.length);
       if (action === "tree.json") {
         // Always attach language (free from path), include size/lines when sizes=1.
         const enriched = entries.map((e) => {
@@ -809,7 +909,7 @@ async function handle(
           if ((e as any).lines !== undefined) out.lines = (e as any).lines;
           return out;
         });
-        return finalize(json({ sha, count: enriched.length, entries: enriched }, 200, metaHeaders));
+        return finalize(json({ sha, count: enriched.length, entries: enriched }, 200, h));
       }
       const body = withSizes
         ? entries.map((e) => {
@@ -819,7 +919,7 @@ async function handle(
               : `${e.path}\t${e.size ?? 0}`;
           }).join("\n")
         : entries.map((e) => e.path).join("\n");
-      return finalize(text(body + (entries.length ? "\n" : ""), 200, metaHeaders));
+      return finalize(text(body + (entries.length ? "\n" : ""), 200, h));
     }
 
     // -----------------------------------------------------------------
@@ -857,6 +957,18 @@ async function handle(
       const language = detectLanguage(path);
       // Prefer the precomputed line count; fall back to counting bytes for older DO schemas.
       const totalLines = file.lines ?? countLines(file.content);
+      const numbered = url.searchParams.get("numbered") === "1";
+
+      // AS-004: prefix each line with ` N | ` when ?numbered=1. The pad width
+      // is the width of the largest line number in the rendered range, so the
+      // pipes align and the agent can read line numbers at a glance.
+      const withLineNumbers = (lines: string[], startLine: number): string => {
+        const lastLine = startLine + lines.length - 1;
+        const pad = String(lastLine).length;
+        return lines
+          .map((L, i) => `${String(startLine + i).padStart(pad)} | ${L}`)
+          .join("\n");
+      };
 
       const linesParam = url.searchParams.get("lines");
       if (linesParam) {
@@ -877,8 +989,11 @@ async function handle(
           return err("bad_lines", `Range ${start}-${end} is empty (end < start).`, 400);
         }
         const effEnd = Math.min(allLines.length, end);
-        const slice = allLines.slice(start - 1, effEnd).join("\n");
-        return finalize(new Response(slice, {
+        const sliceLines = allLines.slice(start - 1, effEnd);
+        const body = numbered
+          ? withLineNumbers(sliceLines, start)
+          : sliceLines.join("\n");
+        return finalize(new Response(body, {
           status: 200,
           headers: {
             "content-type": file.mime + "; charset=utf-8",
@@ -886,10 +1001,30 @@ async function handle(
             "x-gitvfs-line-range": `${start}-${effEnd}`,
             "x-gitvfs-total-lines": String(allLines.length),
             "x-gitvfs-language": language,
+            ...(numbered ? { "x-gitvfs-numbered": "1" } : {}),
             ...metaHeaders,
           },
         }));
       }
+
+      // Whole-file path, optionally numbered.
+      if (numbered) {
+        const decoder = new TextDecoder("utf-8", { fatal: false });
+        const allLines = decoder.decode(file.content).split("\n");
+        const body = withLineNumbers(allLines, 1);
+        return finalize(new Response(body, {
+          status: 200,
+          headers: {
+            "content-type": file.mime + "; charset=utf-8",
+            "access-control-allow-origin": "*",
+            "x-gitvfs-lines": String(totalLines),
+            "x-gitvfs-language": language,
+            "x-gitvfs-numbered": "1",
+            ...metaHeaders,
+          },
+        }));
+      }
+
       return finalize(new Response(file.content as BodyInit, {
         status: 200,
         headers: {
@@ -984,7 +1119,23 @@ async function handle(
     // but with a shape focused on "give me everything in this folder".
     // -----------------------------------------------------------------
     if (action === "outline") {
-      const path = rest.slice(1).join("/");
+      // Accept `path` as URL segment (`/outline/src/foo.ts`) OR as query param
+      // (`?path=src/foo.ts`). Multiple agents tried the query form expecting
+      // consistency with `/file?lines=`; we now honor both.
+      let path = rest.slice(1).join("/");
+      const outlinePathParam = readPathParam(url);
+      if (outlinePathParam instanceof Response) return outlinePathParam;
+      if (outlinePathParam) {
+        if (path) {
+          return err(
+            "conflicting_path",
+            "Use /outline/<path> OR ?path=<path>, not both.",
+            400,
+            { urlPath: path, queryPath: outlinePathParam.path },
+          );
+        }
+        path = outlinePathParam.path;
+      }
       if (!path) return err("missing_path", "Missing file path.", 400);
 
       const depthRaw = url.searchParams.get("depth");
@@ -1050,7 +1201,36 @@ async function handle(
       }
       const rawGlob = url.searchParams.get("glob");
       if (rawGlob === "") return err("bad_glob", "Empty glob.", 400);
-      const glob = rawGlob ? normalizeGlob(rawGlob) : undefined;
+      let glob = rawGlob ? normalizeGlob(rawGlob) : undefined;
+      // Bash-style `path=` scoping. Agents write `?path=src/foo.ts` by analogy
+      // with `grep pattern src/foo.ts` — we translate to a glob that matches
+      // the exact file OR anything beneath that prefix as a directory.
+      const grepPathParam = readPathParam(url);
+      if (grepPathParam instanceof Response) return grepPathParam;
+      if (grepPathParam) {
+        const pathPrefix = grepPathParam.path;
+        // Matches both the literal path (file or dir itself) and `path/...`
+        // (descendants). SQLite GLOB `*` spans `/`, so `prefix*` works for
+        // both cases after normalization.
+        const pathGlob = `${pathPrefix}*`;
+        glob = glob ? `${glob}` : pathGlob;
+        // If the user passed BOTH glob and path, AND both, logically.
+        // We do that by appending path as a second pass exclude-nothing AND.
+        // Simpler: just fold pathGlob in when no explicit glob is set.
+        if (rawGlob) {
+          // Both given: narrow to intersection by letting SQL do two matches.
+          // We accomplish this via excludeGlob on anything NOT matching the path.
+          // (The DO's grep supports multiple exclude_globs but not an AND of
+          // includes.) Simplest correct behavior: refuse this combo for now.
+          return err(
+            "conflicting_path",
+            "Use ?glob=... OR ?path=..., not both.",
+            400,
+            { glob: rawGlob, path: pathPrefix },
+          );
+        }
+        glob = pathGlob;
+      }
       const excludeGlob = url.searchParams.getAll("exclude_glob").map(normalizeGlob);
       const caseParam = url.searchParams.get("case") ?? "";
       const caseInsensitive = caseParam === "i" || caseParam === "1";
@@ -1083,26 +1263,158 @@ async function handle(
           return finalize(text(body + (result.files?.length ? "\n" : ""), 200, metaHeaders));
         }
         return finalize(json({
-          sha, q, truncated: result.truncated, filesScanned: result.filesScanned,
-          count: result.files?.length ?? 0, files: result.files ?? [],
+          sha, q,
+          truncated: result.truncated,
+          filesScanned: result.filesScanned,
+          matchedFiles: result.matchedFiles,
+          count: result.files?.length ?? 0,
+          files: result.files ?? [],
         }, 200, metaHeaders));
       }
 
+      // AS-005: ?symbols=1 annotates each match with its enclosing top-level
+      // symbol name (function/class/method/export). Saves the agent a
+      // follow-up `/outline` call when grep already identifies the region.
+      // We outline each distinct matched path at most once per request.
+      const wantSymbols = url.searchParams.get("symbols") === "1";
+      type AnnotatedMatch = typeof result.matches[number] & { inSymbol?: string };
+      let annotatedMatches: AnnotatedMatch[] = result.matches;
+      if (wantSymbols && result.matches.length > 0) {
+        const byPath = new Map<string, typeof result.matches>();
+        for (const m of result.matches) {
+          const arr = byPath.get(m.path) ?? [];
+          arr.push(m);
+          byPath.set(m.path, arr);
+        }
+        annotatedMatches = [...result.matches];
+        const decoder = new TextDecoder("utf-8", { fatal: false });
+        for (const [p] of byPath) {
+          const f = await stub.read(p);
+          if (!f) continue;
+          const o = outline(p, decoder.decode(f.content), { depth: 2 });
+          // Flatten items + children so we can match inside class members too.
+          const flat: { name: string; line: number; endLine?: number }[] = [];
+          const pushFlat = (it: any) => {
+            flat.push({ name: it.name, line: it.line, endLine: it.endLine });
+            if (Array.isArray(it.children)) for (const c of it.children) pushFlat(c);
+          };
+          for (const it of o.items) pushFlat(it);
+          // Sort by line ascending for linear lookup.
+          flat.sort((a, b) => a.line - b.line);
+          for (const m of annotatedMatches) {
+            if (m.path !== p) continue;
+            // Innermost symbol that encloses this match line.
+            let best: typeof flat[number] | undefined;
+            for (const s of flat) {
+              if (s.line > m.line) break;
+              const end = s.endLine ?? Infinity;
+              if (m.line <= end) best = s;
+            }
+            if (best) (m as AnnotatedMatch).inSymbol = best.name;
+          }
+        }
+      }
+
       if (format === "text" || format === "grep") {
-        const body = result.matches.map((m) => `${m.path}:${m.line}:${m.text}`).join("\n");
-        return finalize(text(body + (result.matches.length ? "\n" : ""), 200, {
+        const body = annotatedMatches
+          .map((m) => `${m.path}:${m.line}:${m.text}`)
+          .join("\n");
+        return finalize(text(body + (annotatedMatches.length ? "\n" : ""), 200, {
           ...metaHeaders,
           "x-gitvfs-truncated": String(result.truncated),
           "x-gitvfs-files-scanned": String(result.filesScanned),
+          "x-gitvfs-matched-files": String(result.matchedFiles),
         }));
       }
       return finalize(json({
         sha, q,
         truncated: result.truncated,
         filesScanned: result.filesScanned,
-        count: result.matches.length,
-        matches: result.matches,
+        matchedFiles: result.matchedFiles,
+        count: annotatedMatches.length,
+        matches: annotatedMatches,
       }, 200, metaHeaders));
+    }
+
+    // -----------------------------------------------------------------
+    // symbol — return a single named symbol from a file.
+    //
+    //   GET /:owner/:repo[@:ref]/symbol/<path>?name=<symbol>
+    //
+    // AS-008: collapses the common "where is foo defined in bar.ts" pattern
+    // to a single request. Same parse as /outline?depth=2, filtered server-side.
+    // -----------------------------------------------------------------
+    if (action === "symbol") {
+      const symPath = rest.slice(1).join("/");
+      if (!symPath) return err("missing_path", "Missing file path.", 400);
+      const name = url.searchParams.get("name");
+      if (!name) {
+        return err(
+          "missing_name",
+          "Missing ?name=<symbol>. Example: /symbol/src/foo.ts?name=myFunc",
+          400,
+        );
+      }
+      const f = await stub.read(symPath);
+      if (!f) {
+        const suggestions = await stub.suggestPaths(symPath);
+        return json(
+          { error: "not_found", path: symPath, suggestions, docs: DOCS_URL, llms_txt: LLMS_TXT_URL },
+          404,
+          metaHeaders,
+        );
+      }
+      const decoder = new TextDecoder("utf-8", { fatal: false });
+      const o = outline(symPath, decoder.decode(f.content), { depth: 2 });
+      const flat: Array<{
+        name: string; line: number; endLine?: number; kind: string; signature?: string;
+      }> = [];
+      const pushFlat = (it: any) => {
+        flat.push({
+          name: it.name, line: it.line, endLine: it.endLine,
+          kind: it.kind, signature: it.signature,
+        });
+        if (Array.isArray(it.children)) for (const c of it.children) pushFlat(c);
+      };
+      for (const it of o.items) pushFlat(it);
+      const match = flat.find((s) => s.name === name);
+      if (!match) {
+        // Closest-name suggestions: Levenshtein on names.
+        const all = [...new Set(flat.map((s) => s.name))];
+        const dist = (a: string, b: string): number => {
+          const m = a.length, n = b.length;
+          if (!m || !n) return Math.max(m, n);
+          const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+          for (let i = 0; i <= m; i++) dp[i][0] = i;
+          for (let j = 0; j <= n; j++) dp[0][j] = j;
+          for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) {
+            dp[i][j] = a[i - 1] === b[j - 1]
+              ? dp[i - 1][j - 1]
+              : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+          }
+          return dp[m][n];
+        };
+        const suggestions = all
+          .map((n) => ({ n, d: dist(n.toLowerCase(), name.toLowerCase()) }))
+          .sort((a, b) => a.d - b.d)
+          .slice(0, 5)
+          .map((x) => x.n);
+        return json(
+          {
+            error: "symbol_not_found",
+            path: symPath, name,
+            suggestions,
+            totalSymbols: flat.length,
+            docs: DOCS_URL, llms_txt: LLMS_TXT_URL,
+          },
+          404,
+          metaHeaders,
+        );
+      }
+      return finalize(json(
+        { sha, path: symPath, ...match, language: o.language },
+        200, metaHeaders,
+      ));
     }
 
     // -----------------------------------------------------------------
