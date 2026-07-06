@@ -37,6 +37,13 @@ export interface OutlineOptions {
   comments?: boolean;
 }
 
+function splitLogicalLines(content: string): string[] {
+  if (content.length === 0) return [];
+  const lines = content.split("\n");
+  if (content.endsWith("\n")) lines.pop();
+  return lines;
+}
+
 const LANG_BY_EXT: Record<string, string> = {
   ts: "typescript", tsx: "typescript",
   js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
@@ -307,7 +314,7 @@ export function outline(path: string, content: string, opts: OutlineOptions = {}
   const wantComments = opts.comments === true;
   const commentFamily = commentFamilyFor(lang);
 
-  const lines = content.split("\n");
+  const lines = splitLogicalLines(content);
   const totalLines = lines.length;
   const items: OutlineItem[] = [];
   const imports: string[] = [];

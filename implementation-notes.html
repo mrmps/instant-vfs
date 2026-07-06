@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>instant-vfs Implementation Notes</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        background: #f6f7f9;
+        color: #1d2430;
+      }
+
+      body {
+        margin: 0;
+        padding: 32px;
+      }
+
+      main {
+        max-width: 1120px;
+        margin: 0 auto;
+      }
+
+      h1,
+      h2 {
+        margin: 0;
+        line-height: 1.15;
+      }
+
+      h1 {
+        font-size: 28px;
+      }
+
+      h2 {
+        margin-top: 28px;
+        font-size: 18px;
+      }
+
+      p,
+      li {
+        line-height: 1.55;
+      }
+
+      code {
+        border: 1px solid #d9dee7;
+        border-radius: 4px;
+        padding: 1px 4px;
+        background: #fff;
+      }
+
+      .note {
+        border: 1px solid #d9dee7;
+        border-radius: 8px;
+        background: #fff;
+        padding: 20px;
+        margin-top: 20px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 20px;
+      }
+
+      @media (max-width: 760px) {
+        body {
+          padding: 20px;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Implementation Notes</h1>
+      <p>
+        Running notes for decisions, tradeoffs, deviations, and open questions in
+        <code>instant-vfs</code>.
+      </p>
+
+      <section class="note">
+        <h2>Better Agent Harness Investigation</h2>
+        <div class="grid">
+          <div>
+            <p>
+              The current <code>bench/agents</code> harness is a custom agent
+              evaluation loop, not a Better Agent app. It directly calls the
+              Anthropic Messages API, defines one <code>http_get</code> tool,
+              executes model-request/tool-result iterations, grades the final
+              answer deterministically, and persists trace artifacts.
+            </p>
+            <p>
+              Better Agent's documented run model is higher level:
+              <code>defineAgent</code>, register agents with
+              <code>betterAgent({ agents })</code>, then call
+              <code>app.agent(name).run()</code> or <code>.stream()</code>.
+              Source review shows that this wraps context validation, optional
+              memory/thread persistence, plugin hooks, abort handling, runtime
+              creation, model calls, tool execution, interruptions, state, and
+              final run records.
+            </p>
+          </div>
+          <div>
+            <ul>
+              <li>
+                Design decision: keep the existing harness custom unless the
+                goal becomes validating Better Agent itself. It is small,
+                deterministic, and optimized for paired gitvfs measurements.
+              </li>
+              <li>
+                Tradeoff: Better Agent would provide typed tools, reusable
+                run/stream plumbing, hooks, and persistence. It would also add
+                framework behavior that the benchmark does not currently need.
+              </li>
+              <li>
+                Open question: whether future benchmark work should add a
+                Better Agent condition to measure framework integration, or
+                keep all conditions on the same minimal Anthropic loop for
+                cleaner gitvfs attribution.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="note">
+        <h2>Endpoint Semantics Fixes</h2>
+        <div class="grid">
+          <div>
+            <p>
+              The file endpoints now share one logical line-count convention:
+              a trailing final newline terminates the previous line and does
+              not create a blank line. The worker keeps the existing stored
+              byte-count logic, then applies matching logical splitting in
+              line slices, numbered output, outlines, and grep context.
+            </p>
+            <p>
+              CORS preflight is handled before repo routing and rate-limit
+              checks. This keeps browser clients from accidentally resolving
+              refs or reading file bodies when they only asked for
+              <code>OPTIONS</code> metadata.
+            </p>
+          </div>
+          <div>
+            <ul>
+              <li>
+                Design decision: out-of-range <code>?lines=</code> requests
+                return <code>416 line_range_not_satisfiable</code> instead of
+                an empty 200 response, because the caller asked for a specific
+                file range that does not exist.
+              </li>
+              <li>
+                Design decision: <code>/bash</code> maps shell non-zero exits
+                to non-2xx HTTP statuses while preserving
+                <code>x-gitvfs-exit-code</code> and text output. Unknown
+                commands use 400, timeouts use 504, and supported command
+                failures use 422.
+              </li>
+              <li>
+                Tradeoff: a grep no-match inside <code>/bash</code> is now
+                HTTP 422 even though the shell runner completed normally. This
+                favors API clients that depend on HTTP status over clients that
+                only inspect shell output.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

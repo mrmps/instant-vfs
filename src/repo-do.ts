@@ -11,6 +11,13 @@ function countLinesBytes(bytes: Uint8Array): number {
   return n;
 }
 
+function splitLogicalLines(text: string): string[] {
+  if (text.length === 0) return [];
+  const lines = text.split("\n");
+  if (text.endsWith("\n")) lines.pop();
+  return lines;
+}
+
 // Any "ingesting" status older than this is treated as a zombie (Worker
 // CPU-cap killed the previous invocation mid-stream) and retried.
 const STALE_INGEST_MS = 3 * 60 * 1000;
@@ -69,12 +76,19 @@ export interface Env {
   GITHUB_TOKEN?: string;
   RL_EXPENSIVE?: RateLimiterBinding;
   RL_GENERAL?: RateLimiterBinding;
+  RL_SUSTAINED?: RateLimiterBinding;
+  RL_INGEST?: RateLimiterBinding;
   METRICS?: MetricsBinding;
   // Shared-secret that, when presented in the X-Gitvfs-Key request header,
   // exempts the request from per-IP rate limiting. Meant for our own tests,
   // benchmarks, and internal tooling. The per-SHA soft throttle still applies
   // — that's a safety net against our own bugs.
   GITVFS_INTERNAL_KEY?: string;
+  // Cloudflare account id (public — visible in the deploy output) and an API
+  // token scoped to `Account Analytics: Read`. Used by /admin/dashboard,
+  // /admin/stats, and /popular to query the GraphQL Analytics API.
+  CF_ACCOUNT_ID?: string;
+  CF_ANALYTICS_TOKEN?: string;
 }
 
 interface IngestStatus {
@@ -206,6 +220,29 @@ export class RepoDO extends DurableObject<Env> {
     };
     this.setMeta("status", JSON.stringify(status));
 
+    // Fleet-wide cap on concurrent new ingests. Protects the GitHub 5000/hr
+    // token budget AND prevents a flood of unique-repo requests from
+    // ballooning total DO storage. Key="global" makes the limit shared
+    // across all DO instances. Limit lives in wrangler.toml (RL_INGEST).
+    if (this.env.RL_INGEST) {
+      const ok = await this.env.RL_INGEST.limit({ key: "global" });
+      if (!ok.success) {
+        const err: IngestStatus = {
+          state: "error", owner, repo, sha, startedAt,
+          finishedAt: Date.now(),
+          error: "ingest_rate_limited_global: too many new repo ingests in flight. Retry in ~60s.",
+        };
+        this.setMeta("status", JSON.stringify(err));
+        return err;
+      }
+    }
+
+    // Max uncompressed-tarball bytes we'll pull from a single repo.
+    // Anything larger likely won't fit in the Worker CPU budget anyway —
+    // capping upfront prevents partial-ingest churn and DO storage
+    // surprises. 250MB covers ~all real codebases (react/next.js fit).
+    const MAX_TARBALL_BYTES = 250 * 1024 * 1024;
+
     try {
       const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${sha}`;
       const headers: Record<string, string> = {
@@ -213,14 +250,38 @@ export class RepoDO extends DurableObject<Env> {
         Accept: "application/vnd.github+json",
       };
       if (this.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${this.env.GITHUB_TOKEN}`;
-      const res = await fetch(url, { headers, redirect: "follow" });
+      let res = await fetch(url, { headers, redirect: "follow" });
+      // Mirror resolveRef: an expired/invalid token 401s here too. Retry
+      // unauthenticated so public-repo tarballs still download instead of
+      // failing the whole ingest.
+      if (res.status === 401 && this.env.GITHUB_TOKEN) {
+        const { Authorization, ...anon } = headers;
+        res = await fetch(url, { headers: anon, redirect: "follow" });
+      }
       if (!res.ok || !res.body) {
         const body = await res.text().catch(() => "");
         const msg = classifyTarballError(res.status, body);
         throw new Error(msg);
       }
 
-      const unzipped = res.body.pipeThrough(new DecompressionStream("gzip"));
+      // Wrap the body in a TransformStream that aborts if we exceed the
+      // tarball byte cap. We measure the COMPRESSED stream (cheaper —
+      // happens before gzip decode) so the cap is conservative on actual
+      // disk usage. 250MB compressed is plenty for source-only repos.
+      let downloaded = 0;
+      const guarded = res.body.pipeThrough(new TransformStream({
+        transform(chunk: Uint8Array, controller) {
+          downloaded += chunk.byteLength;
+          if (downloaded > MAX_TARBALL_BYTES) {
+            controller.error(new Error(
+              `tarball_too_large: ${owner}/${repo}@${sha.slice(0,7)} exceeds ${Math.round(MAX_TARBALL_BYTES / 1024 / 1024)}MB compressed cap`,
+            ));
+            return;
+          }
+          controller.enqueue(chunk);
+        },
+      }) as unknown as TransformStream<Uint8Array, Uint8Array>);
+      const unzipped = (guarded as unknown as ReadableStream<BufferSource>).pipeThrough(new DecompressionStream("gzip"));
 
       let filesStored = 0;
       let bytesStored = 0;
@@ -619,7 +680,7 @@ export class RepoDO extends DurableObject<Env> {
     for (const row of rows) {
       filesScanned++;
       const text = decoder.decode(new Uint8Array(row.content));
-      const lines = text.split("\n");
+      const lines = splitLogicalLines(text);
       let hitInThisFile = false;
       for (let i = 0; i < lines.length; i++) {
         if (re.test(lines[i])) {

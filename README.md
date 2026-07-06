@@ -25,11 +25,11 @@ Landing page at `/` (human-readable) and `/llms.txt` (machine-readable, for agen
 | `GET /outline/<path>` | Top-level symbols (+ `endLine`, `?depth=2` for members, `?comments=1` for JSDoc) |
 | `GET /outline/<dir>` | Bulk outline for every file under a directory |
 | `GET /grep?q=<pat>` | ripgrep-like search |
-| `GET /bash?cmd=<script>` | Read-only shell pipeline (echo, ls, cat, head, tail, wc, grep, find, sort, uniq, sed) |
+| `GET /bash?cmd=<script>` | Read-only shell pipeline (echo, ls, cat, head, tail, wc, grep, find, sort, uniq, sed); non-zero exits return non-2xx plus `x-gitvfs-exit-code` |
 | `GET /head` | Freshness probe: resolves ref → SHA without ingesting |
 | `GET /status` | Ingest state for the current `owner/repo@sha` |
 
-Every response carries `x-gitvfs-sha`, `x-gitvfs-ref`, `x-gitvfs-resolved-at`, `x-gitvfs-age-seconds`, `x-gitvfs-duration-ms`, and `x-gitvfs-source` (`edge` | `do`) headers. `/file` responses additionally carry `x-gitvfs-lines` and `x-gitvfs-language`.
+Every response carries `x-gitvfs-sha`, `x-gitvfs-ref`, `x-gitvfs-resolved-at`, `x-gitvfs-age-seconds`, `x-gitvfs-duration-ms`, and `x-gitvfs-source` (`edge` | `do`) headers. `/file` responses additionally carry `x-gitvfs-lines` and `x-gitvfs-language`. File line counts are logical line counts: a trailing final newline does not create a phantom blank line, and `/file?lines=...` past EOF returns `416 line_range_not_satisfiable`.
 
 ## For agents
 
@@ -55,6 +55,7 @@ Fetch `/llms.txt` at the base URL for a compact, machine-friendly catalog.
 - `GITHUB_TOKEN` secret: 5000 req/hr to GitHub API (vs 60 unauthenticated). Set via `wrangler secret put GITHUB_TOKEN`.
 - `GITVFS_INTERNAL_KEY` secret: the `X-Gitvfs-Key` header bypasses per-IP rate limits for internal tooling (tests, bench, MCP wrapper).
 - Rate limits (per client IP): 30/10s on `/bash` + `/grep`, 100/10s on everything else. Returns 429 with `retry-after`.
+- CORS supports `GET`, `HEAD`, and `OPTIONS`; preflight requests return metadata without executing repo routes.
 - Workers Logs enabled (`[observability]` in `wrangler.toml`) — structured JSON access log per request, searchable + alertable from the dashboard.
 - Workers Analytics Engine dataset `gitvfs_metrics` — per-request `{action, source, status, durationMs}`.
 - DO TTL: 7 days (idle → self-evict via alarm → re-ingest on next request).

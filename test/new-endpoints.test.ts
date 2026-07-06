@@ -9,7 +9,7 @@
 // already ingested (prewarm handles it).
 
 import { describe, expect, test } from "bun:test";
-import { getJson, getText, prewarm } from "./common";
+import { getRaw, getJson, getText, prewarm } from "./common";
 
 describe("/llms.txt", () => {
   test("served at both /llms.txt and /.well-known/llms.txt", async () => {
@@ -188,6 +188,41 @@ describe("/outline enhancements (live)", () => {
   });
 });
 
+describe("logical line counts (live)", () => {
+  test("trailing newline does not create a phantom final line", async () => {
+    await prewarm("octocat/Hello-World");
+
+    const file = await getText("/octocat/Hello-World/file/README?lines=1");
+    expect(file.status).toBe(200);
+    expect(file.body).toBe("Hello World!");
+    expect(file.headers.get("x-gitvfs-line-range")).toBe("1-1");
+    expect(file.headers.get("x-gitvfs-total-lines")).toBe("1");
+
+    const stat = await getJson<any>("/octocat/Hello-World/stat/README");
+    expect(stat.status).toBe(200);
+    expect(stat.body.lines).toBe(1);
+
+    const outline = await getJson<any>("/octocat/Hello-World/outline/README");
+    expect(outline.status).toBe(200);
+    expect(outline.body.totalLines).toBe(1);
+  });
+
+  test("line slicing past EOF is explicit instead of returning a phantom blank line", async () => {
+    await prewarm("octocat/Hello-World");
+    const { status, body } = await getJson<any>("/octocat/Hello-World/file/README?lines=2");
+    expect(status).toBe(416);
+    expect(body.error).toBe("line_range_not_satisfiable");
+    expect(body.totalLines).toBe(1);
+  });
+
+  test("whole-file numbered output omits trailing phantom blank line", async () => {
+    await prewarm("octocat/Hello-World");
+    const { status, body } = await getText("/octocat/Hello-World/file/README?numbered=1");
+    expect(status).toBe(200);
+    expect(body).toBe("1 | Hello World!");
+  });
+});
+
 describe("/bash empty-output footer (live)", () => {
   test("format=text emits exit footer when grep has no matches", async () => {
     await prewarm("sindresorhus/ky");
@@ -195,8 +230,18 @@ describe("/bash empty-output footer (live)", () => {
     const { body, status } = await getText(
       `/sindresorhus/ky/bash?format=text&cmd=${cmd}`,
     );
-    expect(status).toBe(200);
+    expect(status).toBe(422);
     expect(body).toMatch(/^# bash: exit=1/);
+  });
+
+  test("unsupported commands return non-2xx with x-gitvfs-exit-code", async () => {
+    await prewarm("octocat/Hello-World");
+    const cmd = encodeURIComponent("touch x");
+    const res = await getRaw(`/octocat/Hello-World/bash?format=text&cmd=${cmd}`);
+    expect(res.status).toBe(400);
+    expect(res.headers.get("x-gitvfs-exit-code")).toBe("127");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.text()).toContain("command not found");
   });
 
   test("successful empty output (e.g. echo -n) stays truly empty", async () => {

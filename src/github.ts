@@ -4,15 +4,22 @@ export async function resolveRef(
   ref: string,
   token?: string,
 ): Promise<string> {
-  const headers: Record<string, string> = {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits/${ref}`;
+  const base: Record<string, string> = {
     "User-Agent": "gitvfs/0.1",
     Accept: "application/vnd.github+json",
   };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/commits/${ref}`,
-    { headers },
-  );
+  const auth = token
+    ? { ...base, Authorization: `Bearer ${token}` }
+    : base;
+  let res = await fetch(url, { headers: auth });
+  // An expired/invalid token returns 401. Rather than take the whole
+  // service down, fall back to an unauthenticated request — public repos
+  // still resolve (at GitHub's 60/hr anon limit). With no token there is
+  // nothing to retry.
+  if (res.status === 401 && token) {
+    res = await fetch(url, { headers: base });
+  }
   if (!res.ok) throw new Error(`resolveRef ${owner}/${repo}@${ref}: ${res.status}`);
   const j = (await res.json()) as { sha: string };
   return j.sha;

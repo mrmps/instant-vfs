@@ -1,4 +1,5 @@
 import { RepoDO, type Env, type RateLimiterBinding } from "./repo-do";
+import { fetchRepoDetail, fetchStatsBundle, fetchTopRepos, isAnalyticsConfigured, type RepoDetail, type Window } from "./analytics";
 import { isFullSha, isShortSha, looksLikeTag } from "./github";
 import { outline, detectLanguage } from "./outline";
 import { normalizeGlob } from "./glob";
@@ -60,6 +61,13 @@ function countLines(bytes: Uint8Array): number {
   return n;
 }
 
+function splitLogicalLines(text: string): string[] {
+  if (text.length === 0) return [];
+  const lines = text.split("\n");
+  if (text.endsWith("\n")) lines.pop();
+  return lines;
+}
+
 export { RepoDO };
 
 // Security + ergonomics headers applied to every response. These are safe
@@ -70,6 +78,26 @@ const SECURITY_HEADERS: Record<string, string> = {
   "strict-transport-security": "max-age=31536000; includeSubDomains",
 };
 
+const CORS_HEADERS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, HEAD, OPTIONS",
+  "access-control-allow-headers": "content-type, x-gitvfs-key",
+};
+
+function corsPreflight(request: Request): Response {
+  const requestedHeaders = request.headers.get("access-control-request-headers");
+  return new Response(null, {
+    status: 204,
+    headers: {
+      ...CORS_HEADERS,
+      ...(requestedHeaders ? { "access-control-allow-headers": requestedHeaders } : {}),
+      "access-control-max-age": "86400",
+      vary: "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
 // Every 4xx/5xx error body gets these links. Agents (and humans) hitting an
 // unknown endpoint get a direct pointer to the full documentation without
 // having to guess the base URL.
@@ -79,26 +107,28 @@ const LLMS_TXT_URL = "https://gitvfs.miryaboy.workers.dev/llms.txt";
 function json(data: unknown, status = 200, extra: HeadersInit = {}) {
   const base: Record<string, string> = {
     "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": "*",
+    ...CORS_HEADERS,
     ...SECURITY_HEADERS,
   };
-  if (status >= 400) base["cache-control"] = "no-store";
+  const headers = { ...base, ...Object.fromEntries(new Headers(extra)) };
+  if (status >= 400) headers["cache-control"] = "no-store";
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { ...base, ...Object.fromEntries(new Headers(extra)) },
+    headers,
   });
 }
 
 function text(body: string, status = 200, extra: HeadersInit = {}) {
   const base: Record<string, string> = {
     "content-type": "text/plain; charset=utf-8",
-    "access-control-allow-origin": "*",
+    ...CORS_HEADERS,
     ...SECURITY_HEADERS,
   };
-  if (status >= 400) base["cache-control"] = "no-store";
+  const headers = { ...base, ...Object.fromEntries(new Headers(extra)) };
+  if (status >= 400) headers["cache-control"] = "no-store";
   return new Response(body, {
     status,
-    headers: { ...base, ...Object.fromEntries(new Headers(extra)) },
+    headers,
   });
 }
 
@@ -278,7 +308,10 @@ Prefer structured endpoints for exploration:
 - For file contents → /file?lines=A-B&numbered=1 (numbers prefixed per line).
 - For search → /grep (add ?symbols=1 to get enclosing function/class names).
 - For batched reads → /files.
-/bash is an escape hatch for ad-hoc multi-step shell pipelines.
+- /bash is an escape hatch for ad-hoc multi-step shell pipelines (read-only).
+  Shell exit code 0 returns HTTP 200. Non-zero exits return non-2xx
+  (400 for unknown commands, 422 for command failures, 504 for timeout)
+  and always include x-gitvfs-exit-code.
 
 ## Endpoints
 
@@ -303,7 +336,7 @@ x-gitvfs-resolved-at   ISO timestamp of ref→sha resolution
 x-gitvfs-age-seconds   staleness (now − resolved)
 x-gitvfs-pinned        true when URL pins a full SHA (immutable cache)
 x-gitvfs-pin-hint      URL you can use to pin this exact commit
-x-gitvfs-lines         file line count (on /file, /stat, HEAD /file)
+x-gitvfs-lines         logical file line count (trailing final LF is not a blank line)
 x-gitvfs-language      detected language
 x-gitvfs-exit-code     (/bash only)
 x-gitvfs-duration-ms   (/bash only)
@@ -316,6 +349,12 @@ x-gitvfs-truncated     true when results were capped
 - Tag-like refs (vX.Y.Z): 24h + SWR 7d.
 - Branches and default ref: 5m + SWR 1h.
 - ?refresh=1 forces ref re-resolution; /head is a cheap freshness probe.
+
+## Limits
+
+- Per-IP: 100/10s burst, 200/60s sustained.
+- /bash + /grep: 30/10s per IP (CPU-heavy). /bash timeout: 3s default, 5s max.
+- Global ingest cap: 30 new repos/min. Max 250MB compressed tarball.
 
 ## Examples
 
@@ -334,15 +373,37 @@ function landing(host: string): string {
 Replace \`github.com\` with this host and curl it.
 
 Agents: fetch ${host}/llms.txt for a compact, machine-friendly catalog.
+Browse: ${host}/popular for the most-requested repos.
+
+STOP — read this first (agents)
+
+  Before using gitvfs, fetch THIS landing page in full via raw curl:
+
+      curl ${host}/
+
+  Why: summarizing fetchers (Claude Code's WebFetch, ChatGPT browsing,
+  most LLM "fetch URL" tools) pipe the page through a model that
+  paraphrases it. The paraphrase looks correct but silently rewrites
+  literal query-parameter names into generic words — e.g. ?q= becomes
+  "pattern", ?glob= becomes "filter", ?lines= becomes "range". Calls
+  built from the summary then 400 with missing_q / bad_glob / etc.
+
+  Verification: the LAST LINE of the real landing page is exactly:
+
+      [END OF gitvfs LANDING PAGE — sha256: see x-gitvfs-doc-sha header]
+
+  If you don't see that exact sentinel at the end of what you fetched,
+  you received a summary, not the source. Refetch with raw curl.
+
+  Quick check from a shell:
+      curl -s ${host}/ | tail -1
+      # expect: [END OF gitvfs LANDING PAGE ...]
 
 For agents
 
   Use curl (or any raw HTTP client) — not a summarizing fetcher.
-  Tools that paraphrase fetched URLs (e.g. Claude Code's WebFetch,
-  ChatGPT browsing) will return a natural-language summary of the
-  source instead of the code itself. gitvfs also ships extra context
-  via response headers (line counts, language, SHA, freshness) that
-  only survive in a raw HTTP response.
+  gitvfs also ships extra context via response headers (line counts,
+  language, SHA, freshness) that only survive in a raw HTTP response.
 
   Rule of thumb:
     · exploring / reading code        → curl
@@ -394,11 +455,13 @@ Endpoints
 
   GET /:owner/:repo[@:ref]/bash?cmd=<script>
        &format=text                          plain stdout (default is JSON)
-       &timeout_ms=5000                      cap wall-clock (max 15000)
+       &timeout_ms=3000                      cap wall-clock (default 3000, max 5000)
     Runs a read-only shell pipeline against the repo. Supports:
       echo, ls, cat, head, tail, wc, grep, find, sort, uniq, sed
     Pipelines with '|' work. Variables, redirections, loops, writes,
-    and network are not supported.
+    and network are not supported. Per-IP cap: 30 req / 10 s.
+    Exit 0 returns HTTP 200. Non-zero exits return 400/422/504 and
+    include x-gitvfs-exit-code.
 
   GET /:owner/:repo[@:ref]/head              cheap probe: {sha, resolvedAt, pinned}
   GET /:owner/:repo[@:ref]/status            ingest state
@@ -415,10 +478,13 @@ Response metadata (headers on every response)
   x-gitvfs-source          "edge" if served from CF colo cache, absent otherwise
 
   On /file responses additionally:
-    x-gitvfs-lines         total line count for the file
+    x-gitvfs-lines         logical line count; trailing final LF is not a blank line
     x-gitvfs-language      detected language (typescript, go, python, …)
     x-gitvfs-total-lines   present on ?lines=… slices so you know the full size
     x-gitvfs-line-range    the effective range you got back
+
+  /file?lines=… past EOF returns 416 line_range_not_satisfiable rather
+  than a phantom blank line.
 
   On /tree responses with ?outlines=1:
     x-gitvfs-truncated     true if entry count exceeded the per-request cap
@@ -442,13 +508,24 @@ Examples
   curl --get '${host}/facebook/react/bash?format=text' --data-urlencode 'cmd=grep -rln useEffect packages/react/src | head'
   curl --get '${host}/facebook/react/bash?format=text' --data-urlencode 'cmd=sed -n "60,75p" packages/react/src/ReactHooks.js'
 
+Limits
+
+  · Per-IP burst:        100 requests / 10 s
+  · Per-IP sustained:    200 requests / 60 s
+  · /bash + /grep:        30 requests / 10 s per IP (CPU-heavy)
+  · Bash timeout:         default 3 s, max 5 s wall-clock
+  · New-repo ingests:     30 / min globally
+  · Max repo size:        250 MB compressed tarball
+
 Notes
 
   · First request for a repo takes a few seconds (tarball ingest); cached after.
   · Source only — binaries, node_modules, lockfiles, build output skipped.
   · Ref = branch, tag, or full 40-char SHA. Default = default branch.
   · Short SHAs are resolved against GitHub; only full SHAs get long-term cache.
-  · Very large repos (>~50k files) may exceed the Worker CPU budget on first ingest.
+  · Very large repos (>~50k files or >250MB) won't ingest — see limits above.
+
+[END OF gitvfs LANDING PAGE — sha256: see x-gitvfs-doc-sha header]
 `;
 }
 
@@ -474,10 +551,19 @@ export default {
       // any work. Expensive endpoints (/bash, /grep) ALSO get a stricter
       // check later, so cheap endpoints stay cheap. Internal tooling with
       // the X-Gitvfs-Key bypass header skips this layer entirely.
-      const block = bypass
-        ? null
-        : await rateLimit(env.RL_GENERAL, clientIp(request), "general");
-      resp = block ?? await handle(request, env, ctx, url, pathname, bypass);
+      // Two-tier per-IP gate: burst (RL_GENERAL, 100/10s) catches floods,
+      // sustained (RL_SUSTAINED, 200/60s) catches steady drainers. Both
+      // bypassed for internal-key traffic. Either one tripping = 429.
+      if (request.method === "OPTIONS") {
+        resp = corsPreflight(request);
+      } else {
+        let block: Response | null = null;
+        if (!bypass) {
+          block = await rateLimit(env.RL_GENERAL, clientIp(request), "general");
+          if (!block) block = await rateLimit(env.RL_SUSTAINED, clientIp(request), "sustained");
+        }
+        resp = block ?? await handle(request, env, ctx, url, pathname, bypass);
+      }
     } catch (e: any) {
       // Any uncaught exception surfaces as a structured 500 rather than
       // Cloudflare's generic error page — keeps API consumers predictable.
@@ -527,10 +613,21 @@ export default {
 
     // Analytics Engine data point. Fire-and-forget — writeDataPoint is
     // synchronous but very cheap. Safe no-op when METRICS isn't bound.
+    // Schema: blob1=action, blob2=source, blob3=status, blob4=owner,
+    //         blob5=repo, blob6=refKind, blob7=client, blob8=path,
+    //         double1=durationMs, index1=action.
+    // - owner/repo power /popular and the per-repo drill-down
+    // - client answers "which agents are doing this" (claude-code, chatgpt,
+    //   perplexity, cursor, copilot, ...) — see classifyClient()
+    // - path is the truncated pathname+query, used by the failures list
+    //   so operators can copy the exact failing URLs into an agent to fix
     if (env.METRICS) {
       try {
+        const { owner: ownerForMetric, repo: repoForMetric, refKind } = repoFromPath(pathname);
+        const client = classifyClient(request.headers.get("user-agent"));
+        const pathTrunc = pathBucket(pathname, url.search);
         env.METRICS.writeDataPoint({
-          blobs: [action, source, String(out.status)],
+          blobs: [action, source, String(out.status), ownerForMetric, repoForMetric, refKind, client, pathTrunc],
           doubles: [durationMs],
           indexes: [action],
         });
@@ -541,6 +638,561 @@ export default {
   },
 };
 
+// -------------------------------------------------------------------------
+// Observability routes
+// -------------------------------------------------------------------------
+//
+// /popular         — public list of most-requested repos (deepwiki-style).
+// /admin/stats     — JSON: totals, error rate, p50/p95, top repos, by-action.
+// /admin/dashboard — HTML rendering of /admin/stats.
+//
+// Both /admin/* routes require the X-Gitvfs-Key header OR a matching
+// ?key=... query param so a browser can reach the dashboard. The popular
+// list is public; per-repo request counts are observable from outside
+// anyway (anyone can call /<owner>/<repo>/head) and this just makes the
+// aggregate friendlier to browse.
+
+function parseWindow(s: string | null): Window {
+  if (s === "1h" || s === "24h" || s === "7d" || s === "30d") return s;
+  return "24h";
+}
+
+async function handlePopular(env: Env, url: URL): Promise<Response> {
+  if (!isAnalyticsConfigured(env)) {
+    return text(
+      "Popular repos page is unavailable until CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN are configured.\n",
+      503,
+    );
+  }
+  // Default to 7d — "popular" is a long-horizon question; 24h was too
+  // narrow and would render empty during quiet periods.
+  const rawWindow = url.searchParams.get("window");
+  const window = rawWindow ? parseWindow(rawWindow) : "7d";
+  const limit = Math.min(Number(url.searchParams.get("limit") ?? "50") || 50, 200);
+  try {
+    const repos = await fetchTopRepos(env, window, limit);
+    if (url.searchParams.get("format") === "json") {
+      return json({ window, repos });
+    }
+    return html(renderPopular(url.origin, window, repos), 200, {
+      "cache-control": "public, max-age=60, stale-while-revalidate=300",
+    });
+  } catch (e: any) {
+    return text(`analytics_error: ${e?.message ?? String(e)}\n`, 502);
+  }
+}
+
+async function handleAdminStats(env: Env, url: URL): Promise<Response> {
+  if (!isAnalyticsConfigured(env)) {
+    return err("analytics_not_configured", "Set CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN.", 503);
+  }
+  const window = parseWindow(url.searchParams.get("window"));
+  try {
+    const bundle = await fetchStatsBundle(env, window);
+    return json(bundle);
+  } catch (e: any) {
+    return err("analytics_error", e?.message ?? String(e), 502);
+  }
+}
+
+async function handleAdminDashboard(env: Env, url: URL): Promise<Response> {
+  if (!isAnalyticsConfigured(env)) {
+    return text("Set CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN to enable the dashboard.\n", 503);
+  }
+  const window = parseWindow(url.searchParams.get("window"));
+  try {
+    const bundle = await fetchStatsBundle(env, window);
+    return html(renderDashboard(url, bundle), 200, {
+      "cache-control": "public, max-age=60",
+    });
+  } catch (e: any) {
+    return text(`analytics_error: ${e?.message ?? String(e)}\n`, 502);
+  }
+}
+
+async function handleAdminRepo(env: Env, url: URL, owner: string, repo: string): Promise<Response> {
+  if (!isAnalyticsConfigured(env)) {
+    return text("Set CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN to enable repo detail.\n", 503);
+  }
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
+    return err("bad_repo", "Invalid owner/repo.", 400);
+  }
+  const window = parseWindow(url.searchParams.get("window"));
+  try {
+    const detail = await fetchRepoDetail(env, window, owner, repo);
+    if (url.searchParams.get("format") === "json") return json(detail);
+    return html(renderRepoDetail(url, owner, repo, detail), 200, {
+      "cache-control": "public, max-age=60",
+    });
+  } catch (e: any) {
+    return text(`analytics_error: ${e?.message ?? String(e)}\n`, 502);
+  }
+}
+
+// -- HTML rendering --------------------------------------------------------
+
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+}
+
+function fmtNum(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+  return String(Math.round(n));
+}
+
+function html(body: string, status = 200, extra: HeadersInit = {}): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      ...CORS_HEADERS,
+      ...SECURITY_HEADERS,
+      ...Object.fromEntries(new Headers(extra)),
+    },
+  });
+}
+
+const BASE_CSS = `
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 48px 24px; max-width: 980px; margin-inline: auto;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.5; color: #111; background: #fafaf7;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0d0d0c; color: #eee; }
+    a { color: #9ecbff; }
+    .card { background: #161614; border-color: #2a2a27; }
+    .repo { border-color: #2a2a27; }
+    .muted { color: #888; }
+    code, pre { background: #1a1a17; color: #ddd; }
+  }
+  h1 { font-size: 28px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 18px; font-weight: 600; margin: 32px 0 12px; }
+  p.lede { color: #555; margin: 0 0 32px; font-size: 15px; }
+  a { color: #0a6cf1; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: #888; font-size: 13px; }
+  code, pre {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: #f0efea; padding: 1px 5px; border-radius: 3px; font-size: 13px;
+  }
+  .windowbar { display: flex; gap: 8px; margin: 0 0 24px; flex-wrap: wrap; }
+  .windowbar a {
+    padding: 4px 10px; border: 1px solid #ddd; border-radius: 999px;
+    color: #555; font-size: 13px;
+  }
+  .windowbar a.on { background: #111; color: #fff; border-color: #111; }
+  @media (prefers-color-scheme: dark) {
+    .windowbar a { border-color: #333; color: #aaa; }
+    .windowbar a.on { background: #eee; color: #111; border-color: #eee; }
+  }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 32px; }
+  .card { background: #fff; border: 1px solid #e6e3da; border-radius: 10px; padding: 16px 18px; }
+  .card .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .repo {
+    display: flex; align-items: baseline; gap: 16px; padding: 14px 0;
+    border-bottom: 1px solid #ece9df;
+  }
+  .repo:last-child { border-bottom: none; }
+  .repo .name { flex: 1; font-size: 15px; }
+  .repo .name a { color: inherit; font-weight: 500; }
+  .repo .count { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .repo .meta { font-size: 12px; color: #888; min-width: 120px; text-align: right; }
+  table.kv { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.kv td { padding: 6px 0; border-bottom: 1px solid #ece9df; }
+  table.kv td.r { text-align: right; font-variant-numeric: tabular-nums; }
+  table.failures td { vertical-align: top; }
+  table.failures input[type="checkbox"] { transform: translateY(2px); }
+  .failures-toolbar {
+    display: flex; align-items: center; gap: 16px; margin: 4px 0 8px;
+    font-size: 13px;
+  }
+  .btn {
+    font: inherit; font-size: 13px; padding: 4px 10px;
+    border: 1px solid #ccc; background: #fff; border-radius: 6px; cursor: pointer;
+  }
+  .btn:hover { background: #f4f4ef; }
+  @media (prefers-color-scheme: dark) {
+    .btn { background: #1a1a17; color: #eee; border-color: #333; }
+    .btn:hover { background: #232320; }
+  }
+  footer { margin-top: 48px; font-size: 12px; color: #888; }
+`;
+
+const FAILURES_JS = `
+(function(){
+  const all = document.getElementById('select-all-failures');
+  const checks = document.querySelectorAll('.fcheck');
+  const btn = document.getElementById('copy-failures');
+  const status = document.getElementById('copy-status');
+  if (!btn || !checks.length) return;
+  if (all) {
+    all.addEventListener('change', () => {
+      checks.forEach(c => { c.checked = all.checked; });
+    });
+  }
+  btn.addEventListener('click', async () => {
+    const picked = Array.from(checks).filter(c => c.checked);
+    const rows = (picked.length ? picked : Array.from(checks));
+    if (!rows.length) { if (status) status.textContent = 'nothing to copy'; return; }
+    const lines = [
+      '## Recent gitvfs failures',
+      'These are failures observed against the gitvfs HTTP VFS. Investigate root cause and propose a fix.',
+      '',
+      '| time (UTC) | status | action | path | client | count |',
+      '|---|---|---|---|---|---|',
+    ];
+    rows.forEach(r => {
+      const cells = [
+        r.dataset.when, r.dataset.status, r.dataset.action,
+        '\`' + r.dataset.path + '\`', r.dataset.client, r.dataset.count,
+      ];
+      lines.push('| ' + cells.join(' | ') + ' |');
+    });
+    const text = lines.join('\\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      if (status) status.textContent = 'copied ' + rows.length + ' row' + (rows.length === 1 ? '' : 's');
+    } catch (e) {
+      // Fallback: select a hidden textarea
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove();
+      if (status) status.textContent = 'copied (fallback)';
+    }
+    setTimeout(() => { if (status) status.textContent = ''; }, 3000);
+  });
+})();
+`;
+
+function windowBar(origin: string, page: "popular" | "dashboard", active: Window, extraQs = ""): string {
+  const base = page === "dashboard" ? "/admin/dashboard" : "/popular";
+  const windows: Window[] = ["1h", "24h", "7d", "30d"];
+  return `<div class="windowbar">` + windows.map(w => {
+    const cls = w === active ? "on" : "";
+    return `<a class="${cls}" href="${base}?window=${w}${extraQs}">${w}</a>`;
+  }).join("") + `</div>`;
+}
+
+function repoWindowBar(slug: string, active: Window): string {
+  const windows: Window[] = ["1h", "24h", "7d", "30d"];
+  return `<div class="windowbar">` + windows.map(w => {
+    const cls = w === active ? "on" : "";
+    return `<a class="${cls}" href="/admin/repo/${esc(slug)}?window=${w}">${w}</a>`;
+  }).join("") + `</div>`;
+}
+
+function renderPopular(origin: string, window: Window, repos: Awaited<ReturnType<typeof fetchTopRepos>>): string {
+  // Belt-and-suspenders: even if AE has stale rows from an earlier parsing
+  // bug, never render anything that doesn't look like a plausible GitHub
+  // owner/repo (alphanumerics, dots, dashes, underscores).
+  const slugOk = /^[\w.-]+$/;
+  repos = repos.filter(r => slugOk.test(r.owner) && slugOk.test(r.repo));
+  const rows = repos.map(r => {
+    const slug = `${r.owner}/${r.repo}`;
+    return `<div class="repo">
+      <div class="name"><a href="/${esc(slug)}/tree">${esc(slug)}</a>
+        &nbsp;<span class="muted">· <a href="https://github.com/${esc(slug)}">github</a></span></div>
+      <div class="count">${fmtNum(r.requests)}</div>
+      <div class="meta">p50 ${r.p50Ms}ms · p95 ${r.p95Ms}ms${r.errorRate > 0.01 ? ` · <span style="color:#c44">${(r.errorRate * 100).toFixed(1)}% err</span>` : ""}</div>
+    </div>`;
+  }).join("\n");
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Popular repos · gitvfs</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${BASE_CSS}</style>
+</head><body>
+<h1>Popular repos on gitvfs</h1>
+<p class="lede">Most-requested public GitHub repositories served through this gitvfs instance. Counts are sampled estimates from Cloudflare Analytics Engine.</p>
+${windowBar(origin, "popular", window)}
+<div>${rows || `<p class="muted">No traffic in the last ${window}. Try a wider window: <a href="/popular?window=7d">7d</a> · <a href="/popular?window=30d">30d</a>.</p>`}</div>
+<footer>
+  <a href="/">gitvfs</a> · <a href="/llms.txt">/llms.txt</a> · <a href="/popular?window=${window}&format=json">json</a> · refreshes every 60s
+</footer>
+</body></html>`;
+}
+
+function renderDashboard(url: URL, b: Awaited<ReturnType<typeof fetchStatsBundle>>): string {
+  const topReposRows = b.topRepos.map(r => {
+    const slug = `${r.owner}/${r.repo}`;
+    return `<div class="repo">
+      <div class="name"><a href="/admin/repo/${esc(slug)}?window=${b.window}">${esc(slug)}</a>
+        &nbsp;<span class="muted">· <a href="/${esc(slug)}/tree">browse</a> · <a href="https://github.com/${esc(slug)}">github</a></span></div>
+      <div class="count">${fmtNum(r.requests)}</div>
+      <div class="meta">p50 ${r.p50Ms}ms · p95 ${r.p95Ms}ms${r.errorRate > 0.01 ? ` · <span style="color:#c44">${(r.errorRate * 100).toFixed(1)}% err</span>` : ""}</div>
+    </div>`;
+  }).join("\n");
+  const actionRows = b.byAction.map(a =>
+    `<tr><td><code>${esc(a.action)}</code></td><td class="r">${fmtNum(a.requests)}</td><td class="r">${a.p50Ms}ms</td><td class="r">${a.p95Ms}ms</td><td class="r">${a.p99Ms}ms</td></tr>`
+  ).join("");
+  const statusRows = b.byStatus.map(s => {
+    const color = s.status.startsWith("5") ? "color:#c44" : s.status.startsWith("4") ? "color:#c80" : "";
+    return `<tr><td><code style="${color}">${esc(s.status)}</code></td><td class="r">${fmtNum(s.requests)}</td></tr>`;
+  }).join("");
+  const tsPoints = b.timeSeries.map(p => ({
+    label: new Date(p.hour).toISOString().slice(11, 16),
+    value: p.requests,
+  }));
+  const ingestRows = b.ingestFailures.map(f =>
+    `<tr><td><a href="/admin/repo/${esc(f.owner)}/${esc(f.repo)}?window=${b.window}">${esc(f.owner)}/${esc(f.repo)}</a></td><td><code style="color:#c44">${esc(f.reason)}</code></td><td class="r">${fmtNum(f.count)}</td></tr>`
+  ).join("");
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>gitvfs · dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${BASE_CSS}</style>
+</head><body>
+<h1>gitvfs · dashboard</h1>
+<p class="lede">Aggregated traffic for the last ${b.window}. Cached for 60s. Generated ${esc(b.generatedAt)}.</p>
+${windowBar(url.origin, "dashboard", b.window, "")}
+
+<div class="cards">
+  <div class="card"><div class="label">Requests</div><div class="value">${fmtNum(b.totalRequests)}</div></div>
+  <div class="card"><div class="label">Error rate</div><div class="value" style="${b.errorRate > 0.05 ? 'color:#c44' : ''}">${(b.errorRate * 100).toFixed(2)}%</div></div>
+  <div class="card"><div class="label">Cache hit rate</div><div class="value">${(b.cacheHitRate * 100).toFixed(1)}%</div></div>
+  <div class="card"><div class="label">Unique repos</div><div class="value">${fmtNum(b.uniqueRepos)}</div></div>
+  <div class="card"><div class="label">p50 / p95 / p99</div><div class="value" style="font-size:18px">${b.p50Ms} / ${b.p95Ms} / ${b.p99Ms}<span style="font-size:12px;color:#888">ms</span></div></div>
+</div>
+
+<h2>Requests over time</h2>
+${svgBarChart(tsPoints, { height: 140, valueLabel: (v) => fmtNum(v) })}
+
+<h2>Top repos</h2>
+<div>${topReposRows || '<p class="muted">No repo traffic yet.</p>'}</div>
+
+<h2>By action</h2>
+<table class="kv">
+  <tr><td class="muted">action</td><td class="muted r">requests</td><td class="muted r">p50</td><td class="muted r">p95</td><td class="muted r">p99</td></tr>
+  ${actionRows}
+</table>
+
+<h2>By status</h2>
+<table class="kv">
+  <tr><td class="muted">status</td><td class="muted r">requests</td></tr>
+  ${statusRows}
+</table>
+
+<h2>Top errors (4xx / 5xx)</h2>
+<table class="kv">
+  <tr><td class="muted">status</td><td class="muted">action</td><td class="muted">repo</td><td class="muted r">requests</td><td class="muted r">p95</td></tr>
+  ${b.topErrors.length === 0
+    ? `<tr><td class="muted" colspan="5">no errors in this window — nice.</td></tr>`
+    : b.topErrors.map(e => {
+        const color = e.status.startsWith("5") ? "color:#c44" : "color:#c80";
+        const repoCell = (e.owner && e.owner !== "-" && e.owner !== "")
+          ? `<a href="/admin/repo/${esc(e.owner)}/${esc(e.repo)}?window=${b.window}">${esc(e.owner)}/${esc(e.repo)}</a>`
+          : `<span class="muted">(non-repo)</span>`;
+        return `<tr><td><code style="${color}">${esc(e.status)}</code></td><td><code>${esc(e.action)}</code></td><td>${repoCell}</td><td class="r">${fmtNum(e.requests)}</td><td class="r">${e.p95Ms}ms</td></tr>`;
+      }).join("")}
+</table>
+
+<h2>Ingest failures</h2>
+<p class="muted">Repos whose tarball couldn't be ingested — too large, GitHub rate-limited, or other. These are NOT counted in the request error rate above; they're emitted as a separate AE event.</p>
+<table class="kv">
+  <tr><td class="muted">repo</td><td class="muted">reason</td><td class="muted r">events</td></tr>
+  ${ingestRows || `<tr><td class="muted" colspan="3">no ingest failures — nice.</td></tr>`}
+</table>
+
+<h2>What are agents doing? (by client)</h2>
+<p class="muted">Inferred from <code>User-Agent</code> headers. Patterns from <a href="https://github.com/ai-robots-txt/ai.robots.txt">ai-robots-txt</a> (141 known AI/LLM bots) plus library/curl/browser detection.</p>
+<table class="kv">
+  <tr><td class="muted">client</td><td class="muted r">requests</td><td class="muted r">%</td><td class="muted r">unique repos</td><td class="muted r">p50</td><td class="muted r">p95</td><td class="muted r">err</td></tr>
+  ${b.byClient.length === 0
+    ? `<tr><td class="muted" colspan="7">no traffic yet.</td></tr>`
+    : b.byClient.map(c => {
+        const pct = b.totalRequests > 0 ? ((c.requests / b.totalRequests) * 100).toFixed(1) : "0";
+        const errColor = c.errorRate > 0.05 ? "color:#c44" : "";
+        return `<tr><td><code>${esc(c.client)}</code></td><td class="r">${fmtNum(c.requests)}</td><td class="r">${pct}%</td><td class="r">${fmtNum(c.uniqueRepos)}</td><td class="r">${c.p50Ms}ms</td><td class="r">${c.p95Ms}ms</td><td class="r" style="${errColor}">${(c.errorRate * 100).toFixed(1)}%</td></tr>`;
+      }).join("")}
+</table>
+
+<h2>Slow requests (>5s)</h2>
+<p class="muted">Long-tail latency grouped by (action, repo, client). Mostly first-time tarball ingest; recurring entries are worth investigating.</p>
+<table class="kv">
+  <tr><td class="muted">action</td><td class="muted">repo</td><td class="muted">client</td><td class="muted r">slow</td><td class="muted r">total</td><td class="muted r">p95</td><td class="muted r">p99</td></tr>
+  ${b.slowRequests.length === 0
+    ? `<tr><td class="muted" colspan="7">no slow requests — nice.</td></tr>`
+    : b.slowRequests.map(s => {
+        const slug = `${s.owner}/${s.repo}`;
+        return `<tr><td><code>${esc(s.action)}</code></td><td><a href="/admin/repo/${esc(slug)}?window=${b.window}">${esc(slug)}</a></td><td><code>${esc(s.client)}</code></td><td class="r">${fmtNum(s.slowCount)}</td><td class="r">${fmtNum(s.total)}</td><td class="r">${s.p95Ms}ms</td><td class="r">${s.p99Ms}ms</td></tr>`;
+      }).join("")}
+</table>
+
+<h2>Recent failures</h2>
+<p class="muted">Most recent 4xx/5xx grouped by minute. Tick the rows you want to triage, then <button class="btn" id="copy-failures">copy as markdown</button> and paste into your agent of choice.</p>
+<div class="failureslist">
+  ${b.recentFailures.length === 0
+    ? `<p class="muted">no failures in this window — nice.</p>`
+    : `
+      <div class="failures-toolbar">
+        <label><input type="checkbox" id="select-all-failures"> select all</label>
+        <span id="copy-status" class="muted"></span>
+      </div>
+      <table class="kv failures">
+        <tr><td></td><td class="muted">time</td><td class="muted">status</td><td class="muted">action</td><td class="muted">path</td><td class="muted">client</td><td class="muted r">×</td></tr>
+        ${b.recentFailures.map((f, i) => {
+          const statusColor = f.status.startsWith("5") ? "color:#c44" : "color:#c80";
+          const t = f.minute.slice(11, 16);          // HH:MM
+          const date = f.minute.slice(0, 10);         // YYYY-MM-DD
+          // Pack everything needed for the copy into data-* attrs so the
+          // client-side JS doesn't have to re-derive anything.
+          return `<tr>
+            <td><input type="checkbox" class="fcheck" data-i="${i}"
+              data-status="${esc(f.status)}" data-action="${esc(f.action)}"
+              data-path="${esc(f.path)}" data-client="${esc(f.client)}"
+              data-when="${esc(date)} ${esc(t)}" data-count="${f.count}"></td>
+            <td class="muted">${esc(t)}</td>
+            <td><code style="${statusColor}">${esc(f.status)}</code></td>
+            <td><code>${esc(f.action)}</code></td>
+            <td><a href="${esc(f.path)}"><code>${esc(f.path)}</code></a></td>
+            <td><code>${esc(f.client)}</code></td>
+            <td class="r">${fmtNum(f.count)}</td>
+          </tr>`;
+        }).join("")}
+      </table>
+    `}
+</div>
+
+<footer>
+  <a href="/admin/stats?window=${b.window}">stats json</a> ·
+  <a href="/popular?window=${b.window}">public popular</a> ·
+  <a href="/">gitvfs</a>
+</footer>
+<script>${FAILURES_JS}</script>
+</body></html>`;
+}
+
+// --- per-repo detail page -------------------------------------------------
+
+function svgBarChart(rows: { label: string; value: number }[], opts: { width?: number; height?: number; valueLabel?: (v: number) => string } = {}): string {
+  const w = opts.width ?? 720;
+  const h = opts.height ?? 160;
+  const pad = { l: 8, r: 8, t: 8, b: 28 };
+  const innerW = w - pad.l - pad.r;
+  const innerH = h - pad.t - pad.b;
+  if (!rows.length) return `<div class="muted">no data</div>`;
+  const max = Math.max(1, ...rows.map(r => r.value));
+  const bw = innerW / rows.length;
+  const bars = rows.map((r, i) => {
+    const x = pad.l + i * bw + 2;
+    const bh = (r.value / max) * innerH;
+    const y = pad.t + (innerH - bh);
+    const label = (opts.valueLabel ?? ((v: number) => String(v)))(r.value);
+    return `<g>
+      <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw - 4).toFixed(1)}" height="${bh.toFixed(1)}" fill="currentColor" opacity="0.85"/>
+      <title>${esc(r.label)}: ${esc(label)}</title>
+      <text x="${(x + (bw - 4) / 2).toFixed(1)}" y="${(h - 14).toFixed(1)}" text-anchor="middle" font-size="10" fill="currentColor" opacity="0.7">${esc(r.label)}</text>
+      <text x="${(x + (bw - 4) / 2).toFixed(1)}" y="${(h - 2).toFixed(1)}" text-anchor="middle" font-size="9" fill="currentColor" opacity="0.5">${esc(label)}</text>
+    </g>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="color:#0a6cf1">${bars}</svg>`;
+}
+
+function renderRepoDetail(url: URL, owner: string, repo: string, d: RepoDetail): string {
+  const slug = `${owner}/${repo}`;
+  const hist = d.latencyHistogram
+    .sort((a, b) => a.bucketOrder - b.bucketOrder)
+    .map(r => ({ label: r.bucket, value: r.requests }));
+  const ts = d.timeSeries.map(p => ({
+    label: new Date(p.hour).toISOString().slice(11, 16),
+    value: p.requests,
+  }));
+  const actionRows = d.byAction.map(a =>
+    `<tr><td><code>${esc(a.action)}</code></td><td class="r">${fmtNum(a.requests)}</td><td class="r">${a.p50Ms}ms</td><td class="r">${a.p95Ms}ms</td></tr>`,
+  ).join("");
+  const statusRows = d.byStatus.map(s => {
+    const color = s.status.startsWith("5") ? "color:#c44" : s.status.startsWith("4") ? "color:#c80" : "";
+    return `<tr><td><code style="${color}">${esc(s.status)}</code></td><td class="r">${fmtNum(s.requests)}</td></tr>`;
+  }).join("");
+  const sourceRows = d.bySource.map(s => {
+    const hint = s.source === "edge" ? "(cache hit — fast)" : s.source === "do" ? "(DO — includes cold ingest)" : "";
+    return `<tr><td><code>${esc(s.source)}</code> <span class="muted">${esc(hint)}</span></td><td class="r">${fmtNum(s.requests)}</td><td class="r">${s.p50Ms}ms</td><td class="r">${s.p95Ms}ms</td></tr>`;
+  }).join("");
+  const refRows = d.byRefKind.map(r =>
+    `<tr><td><code>${esc(r.refKind)}</code></td><td class="r">${fmtNum(r.requests)}</td></tr>`,
+  ).join("");
+  const cacheHit = (() => {
+    const total = d.bySource.reduce((a, r) => a + r.requests, 0);
+    const edge = d.bySource.find(r => r.source === "edge")?.requests ?? 0;
+    return total > 0 ? `${((edge / total) * 100).toFixed(1)}%` : "—";
+  })();
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>${esc(slug)} · gitvfs admin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${BASE_CSS}</style>
+</head><body>
+<p class="muted"><a href="/admin/dashboard">← dashboard</a></p>
+<h1>${esc(slug)}</h1>
+<p class="lede">
+  Per-repo detail · <a href="/${esc(slug)}/tree">browse on gitvfs</a> ·
+  <a href="https://github.com/${esc(slug)}">github</a> ·
+  generated ${esc(d.generatedAt)}.
+</p>
+${repoWindowBar(slug, d.window)}
+
+<div class="cards">
+  <div class="card"><div class="label">Requests</div><div class="value">${fmtNum(d.totals.requests)}</div></div>
+  <div class="card"><div class="label">Error rate</div><div class="value">${d.totals.requests > 0 ? ((d.totals.errors / d.totals.requests) * 100).toFixed(2) : "0.00"}%</div></div>
+  <div class="card"><div class="label">p50 / p95 / p99</div><div class="value" style="font-size:18px">${d.totals.p50Ms} / ${d.totals.p95Ms} / ${d.totals.p99Ms}<span style="font-size:12px;color:#888">ms</span></div></div>
+  <div class="card"><div class="label">Cache hit rate</div><div class="value">${cacheHit}</div></div>
+</div>
+
+<h2>Requests over time (hourly)</h2>
+${svgBarChart(ts, { height: 140, valueLabel: (v) => fmtNum(v) })}
+
+<h2>Latency distribution</h2>
+${svgBarChart(hist, { height: 160, valueLabel: (v) => fmtNum(v) })}
+<p class="muted">Bars sized by request count in each latency bucket. Long-tail buckets (1s+) are usually cold tarball ingest.</p>
+
+<h2>By source</h2>
+<table class="kv">
+  <tr><td class="muted">source</td><td class="muted r">requests</td><td class="muted r">p50</td><td class="muted r">p95</td></tr>
+  ${sourceRows || `<tr><td class="muted" colspan="4">no data</td></tr>`}
+</table>
+
+<h2>By action</h2>
+<table class="kv">
+  <tr><td class="muted">action</td><td class="muted r">requests</td><td class="muted r">p50</td><td class="muted r">p95</td></tr>
+  ${actionRows || `<tr><td class="muted" colspan="4">no data</td></tr>`}
+</table>
+
+<h2>By status</h2>
+<table class="kv">
+  <tr><td class="muted">status</td><td class="muted r">requests</td></tr>
+  ${statusRows || `<tr><td class="muted" colspan="2">no data</td></tr>`}
+</table>
+
+<h2>By ref kind</h2>
+<table class="kv">
+  <tr><td class="muted">ref kind</td><td class="muted r">requests</td></tr>
+  ${refRows || `<tr><td class="muted" colspan="2">no data</td></tr>`}
+</table>
+
+<h2>Errors</h2>
+<table class="kv">
+  <tr><td class="muted">status</td><td class="muted">action</td><td class="muted r">requests</td><td class="muted r">p95</td></tr>
+  ${d.errorGroups.length === 0
+    ? `<tr><td class="muted" colspan="4">no errors — nice.</td></tr>`
+    : d.errorGroups.map(e => {
+        const color = e.status.startsWith("5") ? "color:#c44" : "color:#c80";
+        return `<tr><td><code style="${color}">${esc(e.status)}</code></td><td><code>${esc(e.action)}</code></td><td class="r">${fmtNum(e.requests)}</td><td class="r">${e.p95Ms}ms</td></tr>`;
+      }).join("")}
+</table>
+
+<footer>
+  <a href="/admin/repo/${esc(slug)}?window=${d.window}&format=json">json</a> ·
+  <a href="/admin/dashboard">dashboard</a> ·
+  <a href="/popular">popular</a>
+</footer>
+</body></html>`;
+}
+
 // Bucket the pathname into a low-cardinality action name for metrics.
 // Avoids emitting one metric series per unique repo/path.
 function endpointBucket(pathname: string): string {
@@ -548,12 +1200,99 @@ function endpointBucket(pathname: string): string {
   if (pathname === "/llms.txt" || pathname === "/.well-known/llms.txt") return "llms";
   if (pathname === "/health") return "health";
   if (pathname === "/favicon.ico" || pathname === "/robots.txt") return "static";
+  if (pathname === "/popular") return "popular";
+  if (pathname.startsWith("/admin/")) return "admin";
   const segs = pathname.split("/").filter(Boolean);
   // Expect at least /owner/repo/<action>. Fallback to "other" on noise.
   if (segs.length < 3) return "other";
   const action = segs[2].split("?")[0];
   if (ACTIONS.has(action)) return action;
   return "other";
+}
+
+// Bucket the User-Agent into a low-cardinality "client" label so the
+// dashboard can answer "what are agents actually doing?". Patterns derived
+// from ai-robots-txt/ai.robots.txt (141 known AI/LLM crawler & agent UAs).
+// Order matters — most specific first. Lowercased input.
+//
+// Buckets are coarse on purpose: ~15 stable categories instead of 141
+// version-tagged strings, so the dashboard breakdown stays useful month
+// over month rather than fragmenting on every minor release bump.
+function classifyClient(ua: string | null): string {
+  if (!ua) return "unknown";
+  const u = ua.toLowerCase();
+  // Anthropic's CLI is the agent identity we care about most — split it out
+  // from "claude" so we can see Claude Code adoption specifically.
+  if (/claude-code|anthropic-claude-code/.test(u)) return "claude-code";
+  if (/claudebot|claude-user|claude-web|claude-searchbot|anthropic-ai/.test(u)) return "claude";
+  if (/gptbot|chatgpt-user|chatgpt agent|oai-searchbot|\boperator\b|openai/.test(u)) return "chatgpt";
+  if (/cursor/.test(u)) return "cursor";
+  if (/copilot|github-copilot/.test(u)) return "copilot";
+  if (/devin/.test(u)) return "devin";
+  if (/perplexity/.test(u)) return "perplexity";
+  if (/google-extended|googleother|notebooklm|googleagent|gemini|google-agent|google-firebase|cloudvertexbot|bedrockbot/.test(u)) return "gemini";
+  if (/mistralai-user/.test(u)) return "mistral";
+  if (/deepseekbot/.test(u)) return "deepseek";
+  if (/cohere-ai|cohere-training/.test(u)) return "cohere";
+  if (/meta-externalagent|meta-externalfetcher|facebookbot|facebookexternalhit/.test(u)) return "meta-ai";
+  if (/firecrawl|tavilybot|exabot|linkupbot|kagi-fetcher|youbot|phindbot/.test(u)) return "ai-search";
+  if (/posthog/.test(u)) return "posthog";
+  if (/ccbot|diffbot|apifybot|bytespider|panscient|amazonbot|applebot|crawl4ai|webzio-extended|img2dataset|laion/.test(u)) return "crawler";
+  if (/^curl\/|\(curl\/|libcurl/.test(u)) return "curl";
+  if (/wget|libwww/.test(u)) return "curl";
+  if (/python-requests|python-urllib|httpx|aiohttp|node-fetch|axios|got\/|\bky\/|okhttp|reqwest|undici/.test(u)) return "library";
+  if (/^mozilla\/5/.test(u) && !/bot|crawler|spider/.test(u)) return "browser";
+  if (/bot|crawler|spider|scraper/.test(u)) return "other-bot";
+  return "other";
+}
+
+// Truncated path+query bucket for the failures list. Strips any obvious
+// secrets (we don't currently accept any, but defensive). 120 chars is
+// long enough to identify the request, short enough to keep AE blob
+// storage in check.
+function pathBucket(pathname: string, search: string): string {
+  // Strip query value of any param literally named "key" or "token".
+  let s = search;
+  if (s) {
+    s = s.replace(/([?&])(key|token|secret)=[^&]*/gi, "$1$2=REDACTED");
+  }
+  const combined = pathname + s;
+  return combined.length > 120 ? combined.slice(0, 117) + "..." : combined;
+}
+
+// Extract (owner, repo, refKind) from a request path so we can group AE
+// metrics by repo. Returns "-" for non-repo paths so blob columns stay
+// non-null (AE rejects undefined blobs, but accepts empty strings).
+function repoFromPath(pathname: string): { owner: string; repo: string; refKind: string } {
+  // Reserved top-level paths that look like /owner/repo but aren't.
+  // Without this, /admin/stats parses as owner=admin, repo=stats and
+  // pollutes the popular list.
+  if (pathname.startsWith("/admin/") || pathname === "/popular"
+      || pathname === "/llms.txt" || pathname === "/.well-known/llms.txt"
+      || pathname === "/health" || pathname === "/favicon.ico" || pathname === "/robots.txt"
+      || pathname === "/" || pathname === "") {
+    return { owner: "-", repo: "-", refKind: "-" };
+  }
+  const segs = pathname.split("/").filter(Boolean);
+  if (segs.length < 2) return { owner: "-", repo: "-", refKind: "-" };
+  const owner = segs[0];
+  let repoAndRef = segs[1];
+  if (repoAndRef.endsWith(".git")) repoAndRef = repoAndRef.slice(0, -4);
+  const at = repoAndRef.indexOf("@");
+  let repo = repoAndRef;
+  let refKind = "default";
+  if (at >= 0) {
+    repo = repoAndRef.slice(0, at);
+    const ref = repoAndRef.slice(at + 1);
+    if (/^[0-9a-f]{40}$/i.test(ref)) refKind = "sha";
+    else if (/^v?\d+\.\d+/.test(ref)) refKind = "tag";
+    else refKind = "branch";
+  }
+  // Validate — anything weird means this isn't really a repo route.
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
+    return { owner: "-", repo: "-", refKind: "-" };
+  }
+  return { owner, repo, refKind };
 }
 
 async function handle(
@@ -564,12 +1303,28 @@ async function handle(
   pathname: string,
   internalBypass: boolean,
 ): Promise<Response> {
-    if (pathname === "/" || pathname === "") return text(landing(url.origin));
+    if (pathname === "/" || pathname === "") {
+      const body = landing(url.origin);
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+      const sha = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+      return text(body, 200, { "x-gitvfs-doc-sha": sha });
+    }
     if (pathname === "/favicon.ico") return new Response(null, { status: 204 });
     if (pathname === "/robots.txt") return text("User-agent: *\nDisallow:\n");
     if (pathname === "/health") return json({ ok: true });
     if (pathname === "/llms.txt" || pathname === "/.well-known/llms.txt") {
       return text(llmsTxt(url.origin));
+    }
+    if (pathname === "/popular") return handlePopular(env, url);
+    if (pathname === "/admin" || pathname === "/admin/") {
+      return new Response(null, { status: 302, headers: { location: "/admin/dashboard" } });
+    }
+    if (pathname === "/admin/stats") return handleAdminStats(env, url);
+    if (pathname === "/admin/dashboard") return handleAdminDashboard(env, url);
+    if (pathname.startsWith("/admin/repo/")) {
+      const parts = pathname.slice("/admin/repo/".length).split("/").filter(Boolean);
+      if (parts.length >= 2) return handleAdminRepo(env, url, parts[0], parts[1]);
+      return err("bad_repo_path", "Expected /admin/repo/<owner>/<repo>.", 400);
     }
 
     const cache = (caches as unknown as { default: Cache }).default;
@@ -932,11 +1687,11 @@ async function handle(
       // Fast HEAD: don't load the BLOB, just existence + metadata.
       if (request.method === "HEAD") {
         const s = await stub.stat(path);
-        if (!s) return new Response(null, { status: 404, headers: metaHeaders });
+        if (!s) return new Response(null, { status: 404, headers: { ...CORS_HEADERS, ...metaHeaders } });
         const headHeaders: Record<string, string> = {
           "content-type": s.mime + "; charset=utf-8",
           "content-length": String(s.size),
-          "access-control-allow-origin": "*",
+          ...CORS_HEADERS,
           "x-gitvfs-language": s.language,
           ...metaHeaders,
         };
@@ -982,13 +1737,21 @@ async function handle(
         }
         const decoder = new TextDecoder("utf-8", { fatal: false });
         const text_ = decoder.decode(file.content);
-        const allLines = text_.split("\n");
+        const allLines = splitLogicalLines(text_);
         const start = Math.max(1, parseInt(m[1], 10));
         const end = m[2] ? parseInt(m[2], 10) : start;
         if (end < start) {
           return err("bad_lines", `Range ${start}-${end} is empty (end < start).`, 400);
         }
-        const effEnd = Math.min(allLines.length, end);
+        if (start > totalLines) {
+          return err(
+            "line_range_not_satisfiable",
+            `Range ${start}-${end} starts after end of file (${totalLines} lines).`,
+            416,
+            { totalLines },
+          );
+        }
+        const effEnd = Math.min(totalLines, end);
         const sliceLines = allLines.slice(start - 1, effEnd);
         const body = numbered
           ? withLineNumbers(sliceLines, start)
@@ -997,9 +1760,9 @@ async function handle(
           status: 200,
           headers: {
             "content-type": file.mime + "; charset=utf-8",
-            "access-control-allow-origin": "*",
+            ...CORS_HEADERS,
             "x-gitvfs-line-range": `${start}-${effEnd}`,
-            "x-gitvfs-total-lines": String(allLines.length),
+            "x-gitvfs-total-lines": String(totalLines),
             "x-gitvfs-language": language,
             ...(numbered ? { "x-gitvfs-numbered": "1" } : {}),
             ...metaHeaders,
@@ -1010,13 +1773,13 @@ async function handle(
       // Whole-file path, optionally numbered.
       if (numbered) {
         const decoder = new TextDecoder("utf-8", { fatal: false });
-        const allLines = decoder.decode(file.content).split("\n");
+        const allLines = splitLogicalLines(decoder.decode(file.content));
         const body = withLineNumbers(allLines, 1);
         return finalize(new Response(body, {
           status: 200,
           headers: {
             "content-type": file.mime + "; charset=utf-8",
-            "access-control-allow-origin": "*",
+            ...CORS_HEADERS,
             "x-gitvfs-lines": String(totalLines),
             "x-gitvfs-language": language,
             "x-gitvfs-numbered": "1",
@@ -1030,7 +1793,7 @@ async function handle(
         headers: {
           "content-type": file.mime + "; charset=utf-8",
           "content-length": String(file.size),
-          "access-control-allow-origin": "*",
+          ...CORS_HEADERS,
           "x-gitvfs-lines": String(totalLines),
           "x-gitvfs-language": language,
           ...metaHeaders,
@@ -1088,7 +1851,7 @@ async function handle(
           status: 200,
           headers: {
             "content-type": "application/x-ndjson; charset=utf-8",
-            "access-control-allow-origin": "*",
+            ...CORS_HEADERS,
             ...metaHeaders,
           },
         }));
@@ -1435,6 +2198,10 @@ async function handle(
           400,
         );
       }
+      // /bash is the CPU outlier — keep it on the stricter per-IP gate
+      // (RL_EXPENSIVE, 30/10s) plus a tight 3s default / 5s max timeout.
+      // Internal-key traffic still skips the per-IP cap but not the
+      // per-SHA throttle below (defense against our own runaway benches).
       if (!internalBypass) {
         const ipBlock = await rateLimit(env.RL_EXPENSIVE, clientIp(request), "bash");
         if (ipBlock) return ipBlock;
@@ -1450,9 +2217,16 @@ async function handle(
       }
       const format = url.searchParams.get("format") ?? "json";
       const timeoutRaw = url.searchParams.get("timeout_ms");
-      const timeoutMs = timeoutRaw ? Math.min(Math.max(100, Number(timeoutRaw)), 15_000) : undefined;
+      // Default 3s, max 5s. Down from 15s — bash is the CPU outlier and a
+      // 15s wall-clock budget was the largest single $ exposure per call.
+      const timeoutMs = timeoutRaw ? Math.min(Math.max(100, Number(timeoutRaw)), 5_000) : 3_000;
 
       const r = await stub.bash(cmd, timeoutMs !== undefined ? { timeoutMs } : {});
+      const bashStatus =
+        r.exitCode === 0 ? 200
+          : r.exitCode === 124 ? 504
+            : r.exitCode === 127 ? 400
+              : 422;
       const bashHeaders: Record<string, string> = {
         ...metaHeaders,
         "x-gitvfs-exit-code": String(r.exitCode),
@@ -1473,9 +2247,19 @@ async function handle(
         if (body === "" && r.exitCode !== 0) {
           body = `# bash: exit=${r.exitCode}, no output (${Math.round(r.durationMs)}ms)\n`;
         }
-        return finalize(text(body, 200, bashHeaders));
+        return finalize(text(body, bashStatus, bashHeaders));
       }
-      return finalize(json({ sha, ...r }, 200, bashHeaders));
+      const jsonBody = r.exitCode === 0
+        ? { sha, ...r }
+        : {
+            error: "bash_exit_nonzero",
+            message: `Command exited with code ${r.exitCode}.`,
+            sha,
+            ...r,
+            docs: DOCS_URL,
+            llms_txt: LLMS_TXT_URL,
+          };
+      return finalize(json(jsonBody, bashStatus, bashHeaders));
     }
 
     return err("unknown_action", `Unknown action: ${action}`, 404);
