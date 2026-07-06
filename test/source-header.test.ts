@@ -16,7 +16,8 @@ describe("x-gitvfs-source header", () => {
 
   test("identical repeat request reports source=edge", async () => {
     // Use stable URL (no cache-bust) so edge can hit.
-    const stableUrl = `/${REPO}/tree?count=1&stable=${Date.now()}`;
+    // _stable is underscore-prefixed so the tree param allowlist accepts it.
+    const stableUrl = `/${REPO}/tree?count=1&_stable=${Date.now()}`;
     await getRaw(stableUrl, {}, { bust: false }); // prime
     await new Promise((r) => setTimeout(r, 1500));
     const res = await getRaw(stableUrl, {}, { bust: false });

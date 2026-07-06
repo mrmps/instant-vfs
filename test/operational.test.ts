@@ -32,6 +32,25 @@ describe("security headers", () => {
     const res = await getRaw("/llms.txt");
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
   });
+
+  test("OPTIONS preflight returns CORS metadata without executing the route", async () => {
+    const res = await getRaw(
+      "/octocat/Hello-World/file/README",
+      {
+        method: "OPTIONS",
+        headers: {
+          origin: "https://example.com",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "x-test, x-gitvfs-key",
+        },
+      },
+    );
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    expect(res.headers.get("access-control-allow-methods")).toContain("GET");
+    expect(res.headers.get("access-control-allow-headers")).toBe("x-test, x-gitvfs-key");
+    expect(await res.text()).toBe("");
+  });
 });
 
 describe("x-gitvfs-duration-ms", () => {

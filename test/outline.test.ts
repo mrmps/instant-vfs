@@ -4,6 +4,14 @@ import { describe, expect, test } from "bun:test";
 import { outline } from "../src/outline";
 
 describe("outline: endLine", () => {
+  test("totalLines follows stored logical line-count semantics", () => {
+    const trailing = outline("README.md", "Hello World!\n");
+    expect(trailing.totalLines).toBe(1);
+
+    const empty = outline("empty.txt", "");
+    expect(empty.totalLines).toBe(0);
+  });
+
   test("ts function: endLine points at the matching closing brace", () => {
     const src = [
       "export function foo(a: number) {",

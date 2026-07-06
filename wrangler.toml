@@ -50,6 +50,25 @@ type = "ratelimit"
 namespace_id = "1002"
 simple = { limit = 100, period = 10 }  # 100 of everything else per IP per 10s
 
+# Per-IP sustained quota. Burst above is fine; sustained ~200/min/IP
+# (12k/hr, ~288k/day) catches steady drainers that the 10s burst limit
+# alone doesn't bound. Legitimate agents stay well below.
+[[unsafe.bindings]]
+name = "RL_SUSTAINED"
+type = "ratelimit"
+namespace_id = "1003"
+simple = { limit = 200, period = 60 }
+
+# Global new-ingest rate. NOT per-IP — this is a fleet-wide cap to
+# protect (a) the GitHub 5000/hr token budget and (b) DO storage churn
+# from a flood of unique-repo requests. ~30 new ingests/min ≈ 1800/hr is
+# well under the GitHub budget and gives ~30s headroom between starts.
+[[unsafe.bindings]]
+name = "RL_INGEST"
+type = "ratelimit"
+namespace_id = "1004"
+simple = { limit = 30, period = 60 }
+
 # --- Metrics (Workers Analytics Engine) ----------------------------------
 # Per-request data point: blobs=[action, source, status], doubles=[durationMs],
 # indexes=[action]. Also writes an ingest-failure point on ingest_too_large.
@@ -65,9 +84,17 @@ dataset = "gitvfs_metrics"
 # [triggers]
 # crons = ["0 */6 * * *"]
 
+# --- Vars (public) -------------------------------------------------------
+# CF_ACCOUNT_ID is the account id this worker runs in. It is NOT secret
+# (visible in `wrangler deploy` output) and is needed as a filter on the
+# GraphQL Analytics API queries that power /popular and /admin/dashboard.
+[vars]
+CF_ACCOUNT_ID = "0f43966d80a42e1f8038d48af053400d"
+
 # --- Secrets (managed outside this file) ---------------------------------
 # Set via wrangler:
-#   wrangler secret put GITHUB_TOKEN        # 5000 req/hr to the GitHub API
-#   wrangler secret put GITVFS_INTERNAL_KEY # bypass per-IP rate limits
+#   wrangler secret put GITHUB_TOKEN          # 5000 req/hr to the GitHub API
+#   wrangler secret put GITVFS_INTERNAL_KEY   # bypass per-IP rate limits + admin auth
+#   wrangler secret put CF_ANALYTICS_TOKEN    # Account Analytics: Read (for /popular + dashboard)
 #
 # Never commit these. Local copies live in .env (gitignored) for tests/bench.

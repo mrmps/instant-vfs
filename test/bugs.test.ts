@@ -221,6 +221,232 @@ describe("missing q on grep", () => {
   });
 });
 
+// AS-001 — see docs/AGENT_STORIES.md
+describe("AS-001: /tree?subpath= must not silently return full tree", () => {
+  test("unknown query params on /tree return 400", async () => {
+    const { status, body } = await getJson(
+      `/${TEST_REPO}/tree?subpath=src/middleware`,
+    );
+    expect(status).toBe(400);
+    expect(body.error).toBe("unknown_query_param");
+    expect(body.param).toBe("subpath");
+  });
+  test("cache-bust params prefixed with _ are allowed", async () => {
+    const res = await getRaw(`/${TEST_REPO}/tree?_cb=abc123`);
+    expect(res.status).toBe(200);
+  });
+});
+
+// AS-002 — see docs/AGENT_STORIES.md
+describe("AS-002: /tree surfaces entry count for pagination", () => {
+  test("/tree response carries x-gitvfs-entries header", async () => {
+    const res = await getRaw(`/${TEST_REPO}/tree`);
+    expect(res.status).toBe(200);
+    const entries = res.headers.get("x-gitvfs-entries");
+    expect(entries).not.toBeNull();
+    expect(Number(entries)).toBeGreaterThan(0);
+  });
+  test("entry count matches body line count on text response", async () => {
+    const res = await getRaw(`/${TEST_REPO}/tree`);
+    const body = await res.text();
+    const bodyLines = body.trim().split("\n").length;
+    const entries = Number(res.headers.get("x-gitvfs-entries"));
+    expect(entries).toBe(bodyLines);
+  });
+});
+
+// AS-003 — see docs/AGENT_STORIES.md. Locks current good behavior.
+describe("AS-003: /grep?pattern= returns 400 missing_q, not silent success", () => {
+  test("pattern= (common wrong guess) 400s with missing_q", async () => {
+    const { status, body } = await getJson(
+      `/${TEST_REPO}/grep?pattern=useMiddleware`,
+    );
+    expect(status).toBe(400);
+    expect(body.error).toBe("missing_q");
+  });
+});
+
+// AS-004 — /file?lines=A-B&numbered=1 prepends line numbers in the body.
+// Source: discovery-bench trace analysis, T06 (useState line lookup).
+// Baseline triangulated with 4 slicing calls because slices had no line numbers.
+describe("AS-004: /file?lines=A-B&numbered=1 prepends line numbers", () => {
+  test("numbered=1 prepends ` N | ` to each line in the slice", async () => {
+    const res = await getRaw(`/${TEST_REPO}/file/src/hono.ts?lines=10-13&numbered=1`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    const lines = body.split("\n");
+    // Each line should start with a zero-padded number, pipe, space.
+    expect(lines[0]).toMatch(/^\s*10 \| /);
+    expect(lines[1]).toMatch(/^\s*11 \| /);
+    expect(lines[2]).toMatch(/^\s*12 \| /);
+    expect(lines[3]).toMatch(/^\s*13 \| /);
+  });
+  test("numbered=0 (default) returns raw content unchanged", async () => {
+    const res = await getRaw(`/${TEST_REPO}/file/src/hono.ts?lines=10-13`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // No line-number prefix.
+    expect(body.split("\n")[0]).not.toMatch(/^\s*\d+ \| /);
+  });
+  test("numbered=1 works without ?lines= (whole file)", async () => {
+    const res = await getRaw(`/${TEST_REPO}/file/src/hono.ts?numbered=1`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body.split("\n")[0]).toMatch(/^\s*1 \| /);
+  });
+});
+
+// AS-005 — grep?symbols=1 annotates each match with enclosing symbol name.
+// Source: discovery-bench trace, T06. Agent had to do outline follow-up to
+// know what function a grep hit was inside.
+describe("AS-005: grep?symbols=1 annotates matches with enclosing symbol", () => {
+  test("?symbols=1 adds inSymbol field to each match", async () => {
+    // Grep for something that lives inside a named export in src/hono.ts.
+    const { status, body } = await getJson<any>(
+      `/${TEST_REPO}/grep?q=extends+HonoBase&symbols=1&limit=5`,
+    );
+    expect(status).toBe(200);
+    expect(body.matches.length).toBeGreaterThan(0);
+    // The `extends HonoBase` line is inside the exported class `Hono`.
+    const m = body.matches.find((x: any) => x.path === "src/hono.ts");
+    expect(m).toBeTruthy();
+    expect(m.inSymbol).toBe("Hono");
+  });
+  test("no ?symbols=1 → no inSymbol field (backward compatible)", async () => {
+    const { body } = await getJson<any>(
+      `/${TEST_REPO}/grep?q=extends+HonoBase&limit=5`,
+    );
+    for (const m of body.matches) {
+      expect(m.inSymbol).toBeUndefined();
+    }
+  });
+});
+
+// AS-006 — grep response adds matchedFiles (clearer than ambiguous filesScanned).
+// Source: discovery-bench trace analysis — filesScanned is consistently misread
+// by agents and humans as "files searched" rather than "files with matches."
+describe("AS-006: grep response carries matchedFiles count", () => {
+  test("matchedFiles is the count of distinct paths with >= 1 match", async () => {
+    const { body } = await getJson<any>(
+      `/${TEST_REPO}/grep?q=middleware&limit=1000`,
+    );
+    expect(typeof body.matchedFiles).toBe("number");
+    const distinctPaths = new Set(body.matches.map((m: any) => m.path)).size;
+    expect(body.matchedFiles).toBe(distinctPaths);
+  });
+  test("files_only mode: matchedFiles equals files.length", async () => {
+    const { body } = await getJson<any>(
+      `/${TEST_REPO}/grep?q=middleware&files_only=1&limit=1000`,
+    );
+    expect(body.matchedFiles).toBe(body.files.length);
+  });
+  test("filesScanned is still present for backward compatibility", async () => {
+    const { body } = await getJson<any>(
+      `/${TEST_REPO}/grep?q=middleware&limit=10`,
+    );
+    expect(typeof body.filesScanned).toBe("number");
+  });
+});
+
+// AS-007 — /llms.txt recommends /outline before /file?lines= for symbol lookups.
+// Source: discovery-bench trace, T06. Agent went to /file?lines= first; /outline
+// would have given the answer in one call.
+describe("AS-007: /llms.txt guides agents to /outline for symbol-location", () => {
+  test("/llms.txt lists /outline before /file in the endpoint section", async () => {
+    const res = await getRaw(`/llms.txt`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // Find the "## Endpoints" section and check the order.
+    const endpointsBlock = body.split("## Endpoints")[1]?.split("##")[0] ?? "";
+    const outlineIdx = endpointsBlock.indexOf("/outline");
+    const fileSliceIdx = endpointsBlock.indexOf("/file/");
+    expect(outlineIdx).toBeGreaterThan(-1);
+    expect(fileSliceIdx).toBeGreaterThan(-1);
+    expect(outlineIdx).toBeLessThan(fileSliceIdx);
+  });
+  test("/llms.txt explicitly names /outline as the answer for line-of-symbol questions", async () => {
+    const res = await getRaw(`/llms.txt`);
+    const body = await res.text();
+    // A single sentence that any agent can find with a regex.
+    expect(body).toMatch(/line.*symbol|symbol.*line|where is .*defined/i);
+    expect(body).toMatch(/\/outline/);
+  });
+});
+
+// AS-008 — /symbol/<path>?name=X collapses "where is foo defined" to 1 call.
+// Source: discovery-bench trace, T06.
+describe("AS-008: /symbol/<path>?name=X returns one symbol", () => {
+  const REACT_SHA = "7aa5dda3b3e4c2baa905a59b922ae7ec14734b24";
+  test("returns {name, line, endLine, kind} for a matching symbol", async () => {
+    const { status, body } = await getJson<any>(
+      `/facebook/react@${REACT_SHA}/symbol/packages/react/src/ReactHooks.js?name=useState`,
+    );
+    expect(status).toBe(200);
+    expect(body.name).toBe("useState");
+    expect(body.line).toBe(93);
+    expect(body.kind).toBeTruthy();
+    expect(body.endLine).toBeGreaterThan(body.line);
+  });
+  test("missing ?name= returns 400", async () => {
+    const { status, body } = await getJson<any>(
+      `/facebook/react@${REACT_SHA}/symbol/packages/react/src/ReactHooks.js`,
+    );
+    expect(status).toBe(400);
+    expect(body.error).toBe("missing_name");
+  });
+  test("unknown name returns 404 with suggestions", async () => {
+    const { status, body } = await getJson<any>(
+      `/facebook/react@${REACT_SHA}/symbol/packages/react/src/ReactHooks.js?name=useDefinitelyNotReal`,
+    );
+    expect(status).toBe(404);
+    expect(body.error).toBe("symbol_not_found");
+    expect(Array.isArray(body.suggestions)).toBe(true);
+  });
+  test("unknown file returns 404 like /outline does", async () => {
+    const { status, body } = await getJson<any>(
+      `/facebook/react@${REACT_SHA}/symbol/does/not/exist.js?name=foo`,
+    );
+    expect(status).toBe(404);
+    expect(body.error).toBe("not_found");
+  });
+});
+
+// AS-009 — unexpanded shell variable in ref returns 400 with a copy-paste hint.
+// Source: in-session repro — URL `.../repo@$PI/tree` sent literally because the
+// `$PI` wasn't set in the browser/tool that received the URL. GitHub 422's it;
+// we were returning a generic `ref_not_found` 404 that didn't explain the cause.
+describe("AS-009: unexpanded shell variable in ref returns helpful 400", () => {
+  test("ref starting with $ returns 400 unexpanded_shell_variable", async () => {
+    const { status, body } = await getJson(`/${TEST_REPO}@$PI/tree`);
+    expect(status).toBe(400);
+    expect(body.error).toBe("unexpanded_shell_variable");
+    expect(body.ref).toBe("$PI");
+    // The message should name the offending ref and tell them what to do.
+    expect(String(body.message)).toMatch(/shell variable|unexpanded/i);
+    expect(String(body.hint)).toMatch(/omit @|literal SHA|set the variable/i);
+  });
+  test("ref with ${...} form also caught", async () => {
+    const { status, body } = await getJson(`/${TEST_REPO}@\${PI}/tree`);
+    expect(status).toBe(400);
+    expect(body.error).toBe("unexpanded_shell_variable");
+  });
+  test("ref with $ in the middle (still clearly shell) also caught", async () => {
+    const { status, body } = await getJson(`/${TEST_REPO}@v1-$BRANCH/tree`);
+    expect(status).toBe(400);
+    expect(body.error).toBe("unexpanded_shell_variable");
+  });
+  test("legit refs with no $ are unaffected", async () => {
+    const res = await getRaw(`/${TEST_REPO}@main/tree?count=1`);
+    // main or head should resolve fine.
+    expect([200, 404]).toContain(res.status);
+    if (res.status === 400) {
+      // If it 400s it must not be for shell-var reasons.
+      const body = await res.json() as any;
+      expect(body.error).not.toBe("unexpanded_shell_variable");
+    }
+  });
+});
+
 describe("ref_not_found is 404, not 500", () => {
   test("nonexistent ref returns 404", async () => {
     const { status, body } = await getJson(
