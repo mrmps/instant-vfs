@@ -146,6 +146,13 @@
               refs or reading file bodies when they only asked for
               <code>OPTIONS</code> metadata.
             </p>
+            <p>
+              The same global request gate now rejects every method other
+              than <code>GET</code>, <code>HEAD</code>, and
+              <code>OPTIONS</code> before routing. This closes the gap where
+              write-shaped verbs were processed as reads despite the
+              advertised CORS contract.
+            </p>
           </div>
           <div>
             <ul>
@@ -167,6 +174,12 @@
                 HTTP 422 even though the shell runner completed normally. This
                 favors API clients that depend on HTTP status over clients that
                 only inspect shell output.
+              </li>
+              <li>
+                Design decision: unsupported methods return the canonical
+                JSON error shape plus <code>Allow: GET, HEAD, OPTIONS</code>.
+                The guard runs before rate limiting and repo resolution so a
+                rejected verb cannot spend repository work or populate cache.
               </li>
             </ul>
           </div>
