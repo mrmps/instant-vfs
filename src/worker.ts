@@ -78,9 +78,12 @@ const SECURITY_HEADERS: Record<string, string> = {
   "strict-transport-security": "max-age=31536000; includeSubDomains",
 };
 
+const ALLOWED_HTTP_METHODS = ["GET", "HEAD", "OPTIONS"] as const;
+const ALLOW_HTTP_METHODS = ALLOWED_HTTP_METHODS.join(", ");
+
 const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, HEAD, OPTIONS",
+  "access-control-allow-methods": ALLOW_HTTP_METHODS,
   "access-control-allow-headers": "content-type, x-gitvfs-key",
 };
 
@@ -556,6 +559,14 @@ export default {
       // bypassed for internal-key traffic. Either one tripping = 429.
       if (request.method === "OPTIONS") {
         resp = corsPreflight(request);
+      } else if (request.method !== "GET" && request.method !== "HEAD") {
+        resp = err(
+          "method_not_allowed",
+          `Method ${request.method} is not allowed.`,
+          405,
+          { allowedMethods: ALLOWED_HTTP_METHODS },
+          { allow: ALLOW_HTTP_METHODS },
+        );
       } else {
         let block: Response | null = null;
         if (!bypass) {

@@ -12,7 +12,8 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 - File line counts are logical line counts. A trailing final newline terminates the last content line and does not create a phantom blank line.
 - `/file`, `/stat`, `/outline`, `HEAD /file`, and `?lines=` metadata must agree on the same logical total line count.
 - A valid `?lines=` range that starts after the end of the file returns `416` with `error: "line_range_not_satisfiable"` and the file's `totalLines`.
-- CORS supports `GET`, `HEAD`, and `OPTIONS`. `OPTIONS` preflight requests return CORS metadata without resolving refs, hitting Durable Objects, rate-limiting as a repo request, or returning route bodies.
+- The HTTP API accepts only `GET`, `HEAD`, and `OPTIONS`. `POST`, `PUT`, `PATCH`, `DELETE`, and other unsupported methods return `405 method_not_allowed` with `Allow: GET, HEAD, OPTIONS` before repo routing, ref resolution, caching, Durable Object access, or rate limiting.
+- CORS advertises `GET`, `HEAD`, and `OPTIONS`. `OPTIONS` preflight requests return CORS metadata without resolving refs, hitting Durable Objects, rate-limiting as a repo request, or returning route bodies.
 - `/bash?cmd=...` runs a read-only shell-shaped pipeline against the repo and always reports the shell exit code in `x-gitvfs-exit-code`.
 - `/bash` returns HTTP `200` for exit code `0`, `400` for unknown commands (`127`), `504` for timeouts (`124`), and `422` for other non-zero command exits.
 
@@ -29,6 +30,7 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 - `Hello World!\n` has exactly one logical line. `?lines=1` returns `Hello World!`; `?lines=2` returns `416 line_range_not_satisfiable`.
 - Whole-file numbered output for a trailing-newline file must not append a blank numbered line.
 - CORS preflight with custom requested headers echoes those requested headers in `access-control-allow-headers`.
+- Unsupported methods receive the same security and CORS headers as other API errors, but no repository metadata because routing never runs.
 - A supported command with no matches, such as `grep` returning exit code `1`, is a completed shell command but still maps to HTTP `422`.
 
 ### Testing Notes
@@ -36,6 +38,7 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 - Unit-test the outline extractor with trailing-newline and empty-file inputs.
 - Integration-test `octocat/Hello-World` through `/file?lines=1`, `/file?lines=2`, `/file?numbered=1`, `/stat`, and `/outline` to prove line-count consistency.
 - Integration-test `OPTIONS` with `Origin`, `Access-Control-Request-Method`, and `Access-Control-Request-Headers`; assert status `204`, no body, CORS headers, and no route body.
+- Integration-test `POST`, `PUT`, `PATCH`, and `DELETE` against a valid repository route; assert `405 method_not_allowed`, the canonical `Allow` header, matching CORS method metadata, and no `x-gitvfs-sha` route metadata.
 - Integration-test `/bash?format=text&cmd=touch%20x` returns `400` with `x-gitvfs-exit-code: 127`.
 - Integration-test a no-match `/bash` grep returns `422` with the empty-output footer and `x-gitvfs-exit-code: 1`.
 

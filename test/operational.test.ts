@@ -53,6 +53,25 @@ describe("security headers", () => {
   });
 });
 
+describe("HTTP method contract", () => {
+  for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+    test(`${method} is rejected before repo routing`, async () => {
+      const res = await getRaw(
+        "/octocat/Hello-World/file/README",
+        { method },
+      );
+      const body = await res.json() as any;
+
+      expect(res.status).toBe(405);
+      expect(body.error).toBe("method_not_allowed");
+      expect(body.allowedMethods).toEqual(["GET", "HEAD", "OPTIONS"]);
+      expect(res.headers.get("allow")).toBe("GET, HEAD, OPTIONS");
+      expect(res.headers.get("access-control-allow-methods")).toBe("GET, HEAD, OPTIONS");
+      expect(res.headers.get("x-gitvfs-sha")).toBeNull();
+    });
+  }
+});
+
 describe("x-gitvfs-duration-ms", () => {
   test("every response carries a numeric duration", async () => {
     const res = await getRaw("/sindresorhus/ky/tree?depth=1");
