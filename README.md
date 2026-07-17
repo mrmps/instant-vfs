@@ -11,7 +11,9 @@ curl 'https://gitvfs.miryaboy.workers.dev/facebook/react/grep?q=useEffect&files_
 curl 'https://gitvfs.miryaboy.workers.dev/pingdotgg/t3code/file/apps/server/src/provider/Layers/CursorAdapter.ts?lines=696-781'
 ```
 
-Landing page at `/` (human-readable) and `/llms.txt` (machine-readable, for agents).
+Browsers receive a minimal human landing page at `/`; raw clients receive the
+full text guide from the same route. `/llms.txt` is the stable machine-readable
+catalog for agents. Use `?format=html` or `?format=text` to select explicitly.
 
 ## Endpoints
 

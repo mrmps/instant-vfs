@@ -8,6 +8,9 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 
 ### Existing Behavior
 
+- `GET /` uses content negotiation: browser requests that accept `text/html` receive a minimal human landing page, while raw clients receive the complete plain-text agent guide. `?format=html` and `?format=text` provide explicit overrides.
+- The human landing page explains the product in plain language, accepts a public GitHub repository URL, generates a copyable agent prompt, and links directly to the complete `/llms.txt` instructions.
+- The generated prompt tells an agent to read `/llms.txt`, use structured discovery endpoints before narrow file reads, and pin a full SHA when reproducibility matters.
 - `GET /:owner/:repo[@:ref]/file/<path>` returns raw file bytes. `?lines=A-B` returns an inclusive logical line slice, and `?numbered=1` prefixes rendered lines with `N | `.
 - File line counts are logical line counts. A trailing final newline terminates the last content line and does not create a phantom blank line.
 - `/file`, `/stat`, `/outline`, `HEAD /file`, and `?lines=` metadata must agree on the same logical total line count.
@@ -19,6 +22,8 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 
 ### Rules And Constraints
 
+- The browser landing page is self-contained HTML, CSS, and JavaScript with no framework or asset dependency; the API remains usable when browser JavaScript is disabled.
+- Plain-text root responses retain the exact end-of-document sentinel and full endpoint reference so existing curl and agent workflows do not regress.
 - Supported `/bash` commands remain read-only: `echo`, `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `find`, `sort`, `uniq`, and `sed`.
 - `/bash` non-zero responses preserve stdout/stderr in text mode so shell-like callers can inspect the failure body while also relying on HTTP status.
 - `/bash` non-zero responses are not cacheable and must carry `cache-control: no-store`.
@@ -27,6 +32,8 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 
 ### Edge Cases
 
+- An explicit `?format=text` wins over a browser `Accept: text/html` header, and `?format=html` wins over a raw-client `Accept` header.
+- An empty or malformed repository field leaves a usable generic prompt instead of generating a broken gitvfs URL.
 - `Hello World!\n` has exactly one logical line. `?lines=1` returns `Hello World!`; `?lines=2` returns `416 line_range_not_satisfiable`.
 - Whole-file numbered output for a trailing-newline file must not append a blank numbered line.
 - CORS preflight with custom requested headers echoes those requested headers in `access-control-allow-headers`.
@@ -35,6 +42,8 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 
 ### Testing Notes
 
+- Integration-test `/` with browser and raw-client `Accept` headers plus both `format` overrides; assert content types, `Vary: Accept`, the human copy controls, and the unchanged plain-text sentinel.
+- Browser-test prompt generation and copy feedback with empty, `owner/repo`, normal GitHub URL, and `.git` URL inputs at desktop and mobile widths.
 - Unit-test the outline extractor with trailing-newline and empty-file inputs.
 - Integration-test `octocat/Hello-World` through `/file?lines=1`, `/file?lines=2`, `/file?numbered=1`, `/stat`, and `/outline` to prove line-count consistency.
 - Integration-test `OPTIONS` with `Origin`, `Access-Control-Request-Method`, and `Access-Control-Request-Headers`; assert status `204`, no body, CORS headers, and no route body.

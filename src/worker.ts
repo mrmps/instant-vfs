@@ -370,6 +370,263 @@ curl --get '${host}/pingdotgg/t3code/bash?format=text' \\
 `;
 }
 
+function wantsHumanLanding(request: Request, url: URL): boolean {
+  const format = url.searchParams.get("format");
+  if (format === "html") return true;
+  if (format === "text") return false;
+  return (request.headers.get("accept") ?? "").toLowerCase().includes("text/html");
+}
+
+function landingHtml(host: string): string {
+  const safeHost = esc(host);
+  const hostForScript = JSON.stringify(host).replace(/</g, "\\u003c");
+  const initialPrompt = `Use gitvfs to inspect [paste a public GitHub repository URL].
+
+First read ${host}/llms.txt for the complete API. Use /tree.json?outlines=1, /grep, and /outline to find the relevant code, then use /file?lines=A-B for only the source lines you need. Resolve /head and pin the full SHA when the answer must be reproducible.
+
+Answer this request with evidence from the repository: [describe what you want to know]`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gitvfs — GitHub for agents</title>
+  <meta name="description" content="Give coding agents a fast, read-only view of any public GitHub repository.">
+  <link rel="alternate" type="text/plain" href="${safeHost}/llms.txt" title="Complete agent instructions">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fbfbfa;
+      --surface: #ffffff;
+      --text: #222321;
+      --muted: #6f716c;
+      --quiet: #969892;
+      --line: #e4e5e1;
+      --line-strong: #cdcec9;
+      --code: #f4f4f1;
+      --accent: #2864dc;
+      --accent-hover: #174eb9;
+      --focus: rgba(40, 100, 220, 0.24);
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-underline-offset: 3px; }
+    button, input { font: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+    .shell { width: calc(100% - 32px); max-width: 800px; margin: 0 auto; }
+    header {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: inline-flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.02em; text-decoration: none; }
+    .brand-mark { width: 9px; height: 9px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 0 4px var(--focus); }
+    nav { display: flex; align-items: center; gap: 20px; }
+    nav a { color: var(--muted); font-size: 14px; text-decoration: none; }
+    nav a:hover { color: var(--text); }
+    main { padding: 88px 0 56px; }
+    .hero { max-width: 680px; }
+    .eyebrow { margin: 0 0 18px; color: var(--accent); font-size: 13px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+    h1 { margin: 0; max-width: 650px; font-size: clamp(36px, 6vw, 54px); line-height: 1.05; letter-spacing: -0.045em; font-weight: 650; }
+    .lede { margin: 22px 0 0; max-width: 600px; color: var(--muted); font-size: 19px; line-height: 1.55; }
+    .builder { margin-top: 56px; }
+    .field-label { display: block; margin-bottom: 9px; color: var(--text); font-size: 14px; font-weight: 600; }
+    .field-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+    input {
+      min-width: 0;
+      height: 46px;
+      padding: 0 14px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+    }
+    input::placeholder { color: var(--quiet); }
+    input:focus { border-color: var(--accent); outline: 3px solid var(--focus); }
+    .copy {
+      height: 46px;
+      padding: 0 17px;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .copy:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    .copy:active { transform: translateY(1px); }
+    .field-help { margin: 9px 0 0; color: var(--quiet); font-size: 13px; }
+    .prompt-panel { margin-top: 20px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .prompt-head { min-height: 42px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
+    .prompt-head span:first-child { font-size: 13px; font-weight: 600; }
+    .prompt-status { min-width: 54px; color: var(--accent); font-size: 12px; text-align: right; }
+    pre { margin: 0; padding: 18px; overflow-x: auto; background: var(--code); white-space: pre-wrap; overflow-wrap: anywhere; }
+    code { color: var(--text); font: 13px/1.65 ui-monospace, "SFMono-Regular", Consolas, monospace; }
+    .steps { margin-top: 54px; display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .step { padding: 22px 22px 22px 0; }
+    .step + .step { padding-left: 22px; border-left: 1px solid var(--line); }
+    .step-number { display: block; margin-bottom: 8px; color: var(--quiet); font: 12px ui-monospace, "SFMono-Regular", Consolas, monospace; }
+    .step strong { display: block; margin-bottom: 5px; font-size: 14px; }
+    .step p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .agent-callout { margin-top: 38px; display: flex; align-items: baseline; justify-content: space-between; gap: 24px; }
+    .agent-callout p { margin: 0; color: var(--muted); font-size: 14px; }
+    .agent-callout a { color: var(--accent); font-size: 14px; font-weight: 600; white-space: nowrap; }
+    footer { margin-top: 72px; padding: 24px 0 32px; border-top: 1px solid var(--line); color: var(--quiet); font-size: 12px; }
+    @media (max-width: 640px) {
+      .shell { width: calc(100% - 24px); }
+      header { height: 56px; }
+      nav a:not(:last-child) { display: none; }
+      main { padding-top: 60px; }
+      h1 { font-size: 38px; }
+      .lede { font-size: 17px; }
+      .builder { margin-top: 42px; }
+      .field-row { grid-template-columns: 1fr; }
+      .copy { width: 100%; }
+      .steps { grid-template-columns: 1fr; }
+      .step, .step + .step { padding: 18px 0; border-left: 0; }
+      .step + .step { border-top: 1px solid var(--line); }
+      .agent-callout { align-items: flex-start; flex-direction: column; gap: 8px; }
+      footer { margin-top: 52px; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111210;
+        --surface: #181917;
+        --text: #eeefeb;
+        --muted: #a6a8a1;
+        --quiet: #7f817a;
+        --line: #2a2c28;
+        --line-strong: #3c3e39;
+        --code: #141513;
+        --accent: #75a0ff;
+        --accent-hover: #8caeff;
+        --focus: rgba(117, 160, 255, 0.2);
+      }
+      input { box-shadow: none; }
+      .copy { color: #101c38; }
+    }
+    @media (prefers-reduced-motion: reduce) { .copy:active { transform: none; } }
+  </style>
+</head>
+<body>
+  <header class="shell">
+    <a class="brand" href="/" aria-label="gitvfs home"><span class="brand-mark" aria-hidden="true"></span>gitvfs</a>
+    <nav aria-label="Primary navigation">
+      <a href="/popular">Popular repos</a>
+      <a href="https://github.com/mrmps/instant-vfs">GitHub</a>
+      <a href="${safeHost}/llms.txt">Agent docs</a>
+    </nav>
+  </header>
+  <main class="shell">
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow">GitHub, shaped for coding agents</p>
+      <h1 id="page-title">Give any agent a fast, read-only view of a GitHub repo.</h1>
+      <p class="lede">No clone, setup, or authentication for public repositories. Paste a repo, copy the prompt, and let your agent fetch only the code it needs.</p>
+    </section>
+
+    <section class="builder" aria-labelledby="builder-title">
+      <label class="field-label" id="builder-title" for="repo-input">GitHub repository</label>
+      <div class="field-row">
+        <input id="repo-input" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://github.com/owner/repo" aria-describedby="repo-help">
+        <button class="copy" id="copy-prompt" type="button">Copy prompt</button>
+      </div>
+      <p class="field-help" id="repo-help">Public repositories only. You can also enter owner/repo.</p>
+
+      <div class="prompt-panel">
+        <div class="prompt-head"><span>Prompt for your agent</span><span class="prompt-status" id="copy-status" aria-live="polite"></span></div>
+        <pre><code id="agent-prompt">${esc(initialPrompt)}</code></pre>
+      </div>
+    </section>
+
+    <section class="steps" aria-label="How gitvfs works">
+      <div class="step"><span class="step-number">01</span><strong>Paste a repo</strong><p>Use a public GitHub URL or owner/repo.</p></div>
+      <div class="step"><span class="step-number">02</span><strong>Copy the prompt</strong><p>It teaches your agent the efficient workflow.</p></div>
+      <div class="step"><span class="step-number">03</span><strong>Ask your question</strong><p>The agent reads the smallest useful files and lines.</p></div>
+    </section>
+
+    <section class="agent-callout" aria-label="Agent instructions">
+      <p><strong>Already an agent?</strong> Skip the UI and read the complete endpoint contract.</p>
+      <a href="${safeHost}/llms.txt">Open /llms.txt →</a>
+    </section>
+
+    <footer>Read-only · public repositories · no account required</footer>
+  </main>
+  <script>
+    (() => {
+      const base = ${hostForScript};
+      const input = document.getElementById("repo-input");
+      const prompt = document.getElementById("agent-prompt");
+      const copyButton = document.getElementById("copy-prompt");
+      const copyStatus = document.getElementById("copy-status");
+
+      function repoSlug(value) {
+        let candidate = value.trim();
+        candidate = candidate.replace(/^https?:\\/\\/(?:www\\.)?github\\.com\\//i, "");
+        candidate = candidate.split(/[?#]/)[0].replace(/^\\/+|\\/+$/g, "");
+        const parts = candidate.split("/");
+        if (parts.length < 2) return null;
+        const owner = parts[0];
+        const repo = parts[1].replace(/\\.git$/i, "");
+        if (!/^[\\w.-]+$/.test(owner) || !/^[\\w.-]+$/.test(repo)) return null;
+        return owner + "/" + repo;
+      }
+
+      function buildPrompt() {
+        const slug = repoSlug(input.value);
+        const githubRepo = slug ? "https://github.com/" + slug : "[paste a public GitHub repository URL]";
+        const vfsRepo = slug ? base + "/" + slug : base + "/OWNER/REPO";
+        return "Use gitvfs to inspect " + githubRepo + ".\\n\\n" +
+          "First read " + base + "/llms.txt for the complete API. Then use " + vfsRepo +
+          "/tree.json?outlines=1, /grep, and /outline to find the relevant code, followed by /file?lines=A-B for only the source lines you need. Resolve " +
+          vfsRepo + "/head and pin the full SHA when the answer must be reproducible.\\n\\n" +
+          "Answer this request with evidence from the repository: [describe what you want to know]";
+      }
+
+      function renderPrompt() {
+        prompt.textContent = buildPrompt();
+        copyStatus.textContent = "";
+      }
+
+      async function copyPrompt() {
+        const value = prompt.textContent || "";
+        try {
+          await navigator.clipboard.writeText(value);
+        } catch {
+          const fallback = document.createElement("textarea");
+          fallback.value = value;
+          fallback.setAttribute("readonly", "");
+          fallback.style.position = "fixed";
+          fallback.style.opacity = "0";
+          document.body.appendChild(fallback);
+          fallback.select();
+          document.execCommand("copy");
+          fallback.remove();
+        }
+        copyStatus.textContent = "Copied";
+      }
+
+      input.addEventListener("input", renderPrompt);
+      copyButton.addEventListener("click", copyPrompt);
+      renderPrompt();
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function landing(host: string): string {
   return `# gitvfs — instant HTTP VFS over any public GitHub repo
 
@@ -1315,10 +1572,12 @@ async function handle(
   internalBypass: boolean,
 ): Promise<Response> {
     if (pathname === "/" || pathname === "") {
-      const body = landing(url.origin);
+      const human = wantsHumanLanding(request, url);
+      const body = human ? landingHtml(url.origin) : landing(url.origin);
       const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
       const sha = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
-      return text(body, 200, { "x-gitvfs-doc-sha": sha });
+      const headers = { "x-gitvfs-doc-sha": sha, vary: "Accept" };
+      return human ? html(body, 200, headers) : text(body, 200, headers);
     }
     if (pathname === "/favicon.ico") return new Response(null, { status: 204 });
     if (pathname === "/robots.txt") return text("User-agent: *\nDisallow:\n");
