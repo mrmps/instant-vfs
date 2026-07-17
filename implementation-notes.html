@@ -130,6 +130,51 @@
       </section>
 
       <section class="note">
+        <h2>Human Landing Page</h2>
+        <div class="grid">
+          <div>
+            <p>
+              The root route now serves a minimal browser UI when the request
+              accepts <code>text/html</code>. Humans get one clear explanation,
+              one repository field, and one prompt to copy into an agent.
+              Raw clients still receive the complete text reference, and
+              <code>/llms.txt</code> remains the stable agent contract.
+            </p>
+            <p>
+              The page is rendered directly by the Worker with inline CSS and
+              a small prompt generator. It adds no frontend framework, build
+              pipeline, font request, image asset, or API mutation.
+            </p>
+          </div>
+          <div>
+            <ul>
+              <li>
+                Design decision: use the <code>Accept</code> header instead of
+                user-agent sniffing. Browsers already request HTML, while
+                curl and programmatic clients normally request raw content.
+              </li>
+              <li>
+                Compatibility decision: <code>?format=html</code> and
+                <code>?format=text</code> make either representation explicit
+                for tests, debugging, and unusual clients.
+              </li>
+              <li>
+                Tradeoff: the UI intentionally teaches the recommended agent
+                workflow rather than exposing every endpoint. The complete
+                catalog stays one click away in <code>/llms.txt</code>.
+              </li>
+              <li>
+                Reference influence: React Doctor informed the direct
+                outcome-first headline and immediate action; React Review
+                informed the narrow reading width, neutral palette, and quiet
+                bordered surfaces.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="note">
         <h2>Endpoint Semantics Fixes</h2>
         <div class="grid">
           <div>

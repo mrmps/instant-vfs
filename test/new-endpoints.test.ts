@@ -11,6 +11,42 @@
 import { describe, expect, test } from "bun:test";
 import { getRaw, getJson, getText, prewarm } from "./common";
 
+describe("/ landing", () => {
+  test("raw clients keep receiving the complete agent guide", async () => {
+    const res = await getRaw("/?format=text", {
+      headers: { accept: "text/html" },
+    });
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    expect(body).toContain("STOP — read this first (agents)");
+    expect(body.trimEnd()).toEndWith("[END OF gitvfs LANDING PAGE — sha256: see x-gitvfs-doc-sha header]");
+  });
+
+  test("browser requests receive the human landing page", async () => {
+    const res = await getRaw("/", {
+      headers: { accept: "text/html,application/xhtml+xml" },
+    });
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(res.headers.get("vary")).toContain("Accept");
+    expect(body).toContain("Give any agent a fast, read-only view of a GitHub repo");
+    expect(body).toContain("Copy prompt");
+    expect(body).toContain("/llms.txt");
+    expect(body).toContain('id="repo-input"');
+  });
+
+  test("format=html explicitly selects the human page", async () => {
+    const res = await getRaw("/?format=html", {
+      headers: { accept: "text/plain" },
+    });
+    expect(res.headers.get("content-type")).toContain("text/html");
+  });
+});
+
 describe("/llms.txt", () => {
   test("served at both /llms.txt and /.well-known/llms.txt", async () => {
     const a = await getText("/llms.txt");
