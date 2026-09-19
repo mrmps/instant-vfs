@@ -18,6 +18,47 @@ function splitLogicalLines(text: string): string[] {
   return lines;
 }
 
+// Prefix scoping without LIKE. Workers' embedded SQLite caps LIKE/GLOB
+// patterns at ~50 bytes and throws "LIKE or GLOB pattern too complex"
+// beyond that (AS-010), which broke every /tree/<deep/prefix> on repos with
+// long paths. `path > 'p/' AND path < 'p0'` selects exactly the descendants
+// of p ('0' is the code point after '/') and uses the primary-key index.
+const PREFIX_CLAUSE = "(path = ? OR (path > ? AND path < ?))";
+function prefixArgs(prefix: string): [string, string, string] {
+  return [prefix, prefix + "/", prefix + "0"];
+}
+
+// GLOB patterns hit the same ~50-byte cap; longer ones are evaluated in JS.
+const SQL_PATTERN_MAX = 48;
+function globFitsSql(g: string): boolean {
+  return new TextEncoder().encode(g).length <= SQL_PATTERN_MAX;
+}
+export function globToRegExp(g: string): RegExp {
+  // SQLite GLOB semantics: `*` any run (including '/'), `?` one char,
+  // `[...]` class. Everything else literal.
+  let re = "^";
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === "*") re += ".*";
+    else if (c === "?") re += ".";
+    else if (c === "[") {
+      const end = g.indexOf("]", i + 1);
+      if (end > i) { re += "[" + g.slice(i + 1, end).replace(/\\/g, "\\\\") + "]"; i = end; }
+      else re += "\\[";
+    } else re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(re + "$");
+}
+function pushGlob(clauses: string[], args: unknown[], glob: string | undefined): RegExp | null {
+  if (!glob) return null;
+  if (globFitsSql(glob)) {
+    clauses.push("path GLOB ?");
+    args.push(glob);
+    return null;
+  }
+  return globToRegExp(glob);
+}
+
 // Any "ingesting" status older than this is treated as a zombie (Worker
 // CPU-cap killed the previous invocation mid-stream) and retried.
 const STALE_INGEST_MS = 3 * 60 * 1000;
@@ -89,6 +130,11 @@ export interface Env {
   // /admin/stats, and /popular to query the GraphQL Analytics API.
   CF_ACCOUNT_ID?: string;
   CF_ANALYTICS_TOKEN?: string;
+  // TypeSafe API key (console.typesafe.ai). Powers the semantic endpoints
+  // (/find, /verify, grep?intent=, file?about=, tree?roles=1). When unset,
+  // those endpoints return 503 semantic_unavailable and the lexical ones
+  // behave exactly as before.
+  TYPESAFE_API_KEY?: string;
 }
 
 interface IngestStatus {
@@ -142,6 +188,9 @@ export class RepoDO extends DurableObject<Env> {
     `);
     // Migrate pre-existing DO schemas (created before the `lines` column).
     try { this.sql.exec("ALTER TABLE files ADD COLUMN lines INTEGER"); } catch {}
+    // Semantic answers are a pure function of (sha, question); this DO is
+    // one sha, so cache them here. Evicted with everything else on alarm.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS semantic_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)");
   }
 
   private getMeta(key: string): string | null {
@@ -329,14 +378,18 @@ export class RepoDO extends DurableObject<Env> {
     const clauses: string[] = [];
     const args: unknown[] = [];
     if (prefix) {
-      clauses.push("(path = ? OR path LIKE ?)");
-      args.push(prefix, prefix + "/%");
+      clauses.push(PREFIX_CLAUSE);
+      args.push(...prefixArgs(prefix));
     }
-    if (opts.glob) {
-      clauses.push("path GLOB ?");
-      args.push(opts.glob);
-    }
+    const jsGlob = pushGlob(clauses, args, opts.glob);
     const where = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
+    if (jsGlob) {
+      let n = 0;
+      for (const r of this.sql.exec<{ path: string }>(`SELECT path FROM files ${where}`, ...args)) {
+        if (jsGlob.test(r.path)) n++;
+      }
+      return n;
+    }
     const row = [...this.sql.exec<{ n: number }>(
       `SELECT count(*) AS n FROM files ${where}`, ...args,
     )][0];
@@ -351,18 +404,16 @@ export class RepoDO extends DurableObject<Env> {
     const clauses: string[] = [];
     const args: unknown[] = [];
     if (prefix) {
-      clauses.push("(path = ? OR path LIKE ?)");
-      args.push(prefix, prefix + "/%");
+      clauses.push(PREFIX_CLAUSE);
+      args.push(...prefixArgs(prefix));
     }
-    if (opts.glob) {
-      clauses.push("path GLOB ?");
-      args.push(opts.glob);
-    }
+    const jsGlob = pushGlob(clauses, args, opts.glob);
     const where = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
     const sql = opts.withSizes
       ? `SELECT path, size, lines FROM files ${where} ORDER BY path`
       : `SELECT path FROM files ${where} ORDER BY path`;
-    const rows = this.sql.exec<{ path: string; size?: number; lines?: number | null }>(sql, ...args);
+    const rowsAll = this.sql.exec<{ path: string; size?: number; lines?: number | null }>(sql, ...args);
+    const rows = jsGlob ? [...rowsAll].filter((r) => jsGlob.test(r.path)) : rowsAll;
     return opts.withSizes
       ? [...rows].map((r) => {
           const entry: { path: string; size?: number; lines?: number } = { path: r.path, size: r.size };
@@ -397,19 +448,20 @@ export class RepoDO extends DurableObject<Env> {
     const clauses: string[] = [];
     const args: unknown[] = [];
     if (prefix) {
-      clauses.push("(path = ? OR path LIKE ?)");
-      args.push(prefix, prefix + "/%");
+      clauses.push(PREFIX_CLAUSE);
+      args.push(...prefixArgs(prefix));
     }
-    if (opts.glob) {
-      clauses.push("path GLOB ?");
-      args.push(opts.glob);
-    }
+    const jsGlob = pushGlob(clauses, args, opts.glob);
     const where = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
-    // +1 so we can tell if the caller's slice was truncated.
-    const sql = `SELECT path, size, mime, lines, content FROM files ${where} ORDER BY path LIMIT ?`;
-    const rows = this.sql.exec<{
+    // +1 so we can tell if the caller's slice was truncated. With a JS-side
+    // glob we cannot LIMIT in SQL, so we stream and stop once we have enough.
+    const sql = `SELECT path, size, mime, lines, content FROM files ${where} ORDER BY path${jsGlob ? "" : " LIMIT ?"}`;
+    const rowsRaw = this.sql.exec<{
       path: string; size: number; mime: string; lines: number | null; content: ArrayBuffer;
-    }>(sql, ...args, maxFiles + 1);
+    }>(sql, ...(jsGlob ? args : [...args, maxFiles + 1]));
+    const rows = jsGlob
+      ? (function* () { let n = 0; for (const r of rowsRaw) { if (!jsGlob.test(r.path)) continue; yield r; if (++n > maxFiles) return; } })()
+      : rowsRaw;
 
     const decoder = new TextDecoder("utf-8", { fatal: false });
     const entries: Array<{
@@ -463,8 +515,8 @@ export class RepoDO extends DurableObject<Env> {
     const clauses: string[] = [];
     const args: unknown[] = [];
     if (prefix) {
-      clauses.push("(path = ? OR path LIKE ?)");
-      args.push(prefix, prefix + "/%");
+      clauses.push(PREFIX_CLAUSE);
+      args.push(...prefixArgs(prefix));
     }
     const where = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
     const rows = [...this.sql.exec<{ path: string; size: number; lines: number | null }>(
@@ -546,18 +598,20 @@ export class RepoDO extends DurableObject<Env> {
     // Find near-neighbor paths: same basename, or same parent dir, or substring match.
     const base = path.split("/").pop() ?? path;
     const parent = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
+    const tail = "/" + base;
+    const stem = "/" + base.slice(0, Math.max(3, base.length - 2));
     const rows = this.sql.exec<{ path: string; score: number }>(
       `SELECT path,
          (CASE WHEN path = ? THEN 100 ELSE 0 END) +
-         (CASE WHEN path LIKE ? THEN 50 ELSE 0 END) +
-         (CASE WHEN path LIKE ? THEN 20 ELSE 0 END) AS score
+         (CASE WHEN substr(path, -?) = ? OR path = ? THEN 50 ELSE 0 END) +
+         (CASE WHEN ${parent ? "(path > ? AND path < ?)" : "instr(path, ?) > 0"} THEN 20 ELSE 0 END) AS score
        FROM files
        WHERE score > 0
        ORDER BY score DESC, length(path) ASC
        LIMIT ?`,
       path,
-      `%/${base}`,
-      parent ? `${parent}/%` : `%/${base.slice(0, Math.max(3, base.length - 2))}%`,
+      tail.length, tail, base,
+      ...(parent ? [parent + "/", parent + "0"] : [stem]),
       limit,
     );
     return [...rows].map((r) => r.path);
@@ -638,38 +692,52 @@ export class RepoDO extends DurableObject<Env> {
     if (opts.word) basePattern = `\\b(?:${basePattern})\\b`;
     const re = new RegExp(basePattern, flags);
 
-    // SQL prefilter: literal LIKE only when not regex and not word-boundary (those need true regex).
+    // SQL prefilter: literal substring test only when not regex and not
+    // word-boundary (those need true regex). instr() rather than LIKE: LIKE
+    // treats `_`/`%` in the needle as wildcards and DO SQLite rejects
+    // patterns over ~50 bytes ("LIKE or GLOB pattern too complex").
     const coarse =
       !opts.regex && !opts.word
-        ? (opts.caseInsensitive ? `%${opts.q.toLowerCase()}%` : `%${opts.q}%`)
+        ? (opts.caseInsensitive ? opts.q.toLowerCase() : opts.q)
         : null;
 
     const whereClauses: string[] = [];
     const args: unknown[] = [];
-    if (opts.glob) {
-      whereClauses.push("path GLOB ?");
-      args.push(opts.glob);
-    }
+    const jsGlob = pushGlob(whereClauses, args, opts.glob);
+    const jsExcludes: RegExp[] = [];
     if (opts.excludeGlob?.length) {
       for (const x of opts.excludeGlob) {
-        whereClauses.push("NOT (path GLOB ?)");
-        args.push(x);
+        if (globFitsSql(x)) {
+          whereClauses.push("NOT (path GLOB ?)");
+          args.push(x);
+        } else {
+          jsExcludes.push(globToRegExp(x));
+        }
       }
     }
     if (coarse !== null) {
       whereClauses.push(
         opts.caseInsensitive
-          ? "lower(CAST(content AS TEXT)) LIKE ?"
-          : "CAST(content AS TEXT) LIKE ?",
+          ? "instr(lower(CAST(content AS TEXT)), ?) > 0"
+          : "instr(CAST(content AS TEXT), ?) > 0",
       );
       args.push(coarse);
     }
 
     const where = whereClauses.length ? "WHERE " + whereClauses.join(" AND ") : "";
-    const rows = this.sql.exec<{ path: string; content: ArrayBuffer }>(
+    const rowsRaw = this.sql.exec<{ path: string; content: ArrayBuffer }>(
       `SELECT path, content FROM files ${where}`,
       ...args,
     );
+    const rows = (jsGlob || jsExcludes.length)
+      ? (function* () {
+          for (const r of rowsRaw) {
+            if (jsGlob && !jsGlob.test(r.path)) continue;
+            if (jsExcludes.some((x) => x.test(r.path))) continue;
+            yield r;
+          }
+        })()
+      : rowsRaw;
 
     const out: { path: string; line: number; text: string; before?: string[]; after?: string[] }[] = [];
     const fileSet = new Set<string>();
@@ -814,7 +882,7 @@ export class RepoDO extends DurableObject<Env> {
         )][0];
         if (hasFile) return "file";
         const hasUnder = [...this.sql.exec<{ x: number }>(
-          "SELECT 1 as x FROM files WHERE path LIKE ? LIMIT 1", path + "/%",
+          "SELECT 1 as x FROM files WHERE path > ? AND path < ? LIMIT 1", path + "/", path + "0",
         )][0];
         return hasUnder ? "dir" : null;
       },
@@ -839,8 +907,21 @@ export class RepoDO extends DurableObject<Env> {
     return runBash(script, vfs, opts);
   }
 
+  async semanticGet(key: string): Promise<string | null> {
+    const row = [...this.sql.exec<{ value: string }>("SELECT value FROM semantic_cache WHERE key = ?", key)];
+    return row[0]?.value ?? null;
+  }
+
+  async semanticPut(key: string, value: string): Promise<void> {
+    this.sql.exec(
+      "INSERT OR REPLACE INTO semantic_cache (key, value, created_at) VALUES (?, ?, ?)",
+      key, value, Date.now(),
+    );
+  }
+
   async deleteAll() {
     this.sql.exec("DELETE FROM files");
     this.sql.exec("DELETE FROM meta");
+    this.sql.exec("DELETE FROM semantic_cache");
   }
 }

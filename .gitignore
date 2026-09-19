@@ -10,3 +10,4 @@ bench/results/*
 # `bench/agents/results/traces/` and `*-report.md` under git so bench
 # history diffs as a first-class artifact. No exclusions needed here.
 
+.dev.vars

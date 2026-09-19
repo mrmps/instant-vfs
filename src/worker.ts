@@ -4,6 +4,12 @@ import { isFullSha, isShortSha, looksLikeTag } from "./github";
 import { outline, detectLanguage } from "./outline";
 import { normalizeGlob } from "./glob";
 import { resolveRefCached } from "./ref-cache";
+import { JevMeter, JevError } from "./jev";
+import {
+  find as semanticFind, rerank as semanticRerank, locate as semanticLocate,
+  roles as semanticRoles, verify as semanticVerify, meantParam, ROLES,
+  type Source as SemanticSource,
+} from "./semantic";
 
 // Extract the client IP for rate-limit keying. cf-connecting-ip is populated
 // by Cloudflare for every request; fall back to "anon" so a missing header
@@ -200,14 +206,20 @@ function readPathParam(url: URL): { path: string } | Response | null {
 // `bad_path` error burns 2–3 calls while the agent guesses URL shapes.
 // Embedding expected/example/got makes the error self-correcting.
 function badPath(got: string, message?: string) {
+  // Docs write the optional ref as `[@<ref>]`; some agents paste the brackets
+  // (`/owner/repo[@sha]/find`). Hand back the de-bracketed URL.
+  const debracketed = /\[@[^\]/]*\]|[<>]/.test(got)
+    ? got.replace(/\[@([^\]/]*)\]/g, "@$1").replace(/[<>]/g, "")
+    : null;
   return json(
     {
       error: "bad_path",
       message: message ?? "URL must start with /:owner/:repo.",
-      expected: "/:owner/:repo[@:ref]/<action>[/<path>]",
-      example: "/facebook/react/tree   or   /honojs/hono/grep?q=middleware",
+      expected: "/:owner/:repo[@:ref]/<action>[/<path>]  (brackets mean optional — do not type them)",
+      example: "/facebook/react/tree   or   /honojs/hono@cf2d2b7/grep?q=middleware",
       got,
-      actions: ["tree", "tree.json", "file", "stat", "outline", "grep", "head", "status", "bash", "files"],
+      ...(debracketed && debracketed !== got ? { suggested: debracketed, hint: `Remove the brackets: ${debracketed}` } : {}),
+      actions: [...ACTIONS],
       docs: DOCS_URL,
       llms_txt: LLMS_TXT_URL,
     },
@@ -225,7 +237,71 @@ interface ParsedRepo {
 const ACTIONS = new Set([
   "tree", "tree.json", "file", "files", "stat", "grep", "status",
   "outline", "symbol", "count", "head", "bash",
+  "find", "ask", "locate", "verify",
 ]);
+
+// ---------------------------------------------------------------------------
+// Semantic layer plumbing (see src/semantic.ts). The DO holds the data; Jev
+// supplies the judgment. Answers are a pure function of (sha, question), so
+// they are cached inside the per-sha DO in addition to the edge cache.
+// ---------------------------------------------------------------------------
+
+function semanticSource(stub: DurableObjectStub<RepoDO>): SemanticSource {
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  return {
+    async paths() { return (await stub.tree()).map((e) => e.path); },
+    async level(prefix) {
+      const entries = await stub.treeLevel(prefix ? { prefix } : {});
+      return entries.map((e) => ({ path: e.path, kind: e.kind }));
+    },
+    async read(path) {
+      const f = await stub.read(path);
+      return f ? decoder.decode(f.content) : null;
+    },
+    async grep(opts) {
+      const r = await stub.grep(opts);
+      return { files: r.files, matches: r.matches };
+    },
+  };
+}
+
+function semanticUnavailable(): Response {
+  return err(
+    "semantic_unavailable",
+    "This endpoint needs TypeSafe's Jev (TYPESAFE_API_KEY is not configured on this deployment). Lexical endpoints (/tree, /grep, /outline, /file) still work.",
+    503,
+    { hint: "Set TYPESAFE_API_KEY via `wrangler secret put TYPESAFE_API_KEY` (key from console.typesafe.ai)." },
+    { "retry-after": "60" },
+  );
+}
+
+function semanticFailed(e: unknown): Response {
+  const msg = e instanceof JevError ? e.message : (e as any)?.message ?? String(e);
+  const status = e instanceof JevError && e.status === 429 ? 429 : 502;
+  return err(
+    "semantic_upstream_failed",
+    `The judgment model did not answer: ${msg}`,
+    status,
+    { hint: "Retry, or fall back to /grep, /outline and /tree which need no model." },
+    { "retry-after": "5" },
+  );
+}
+
+// Look up / store a semantic answer in the per-sha DO. Key must include
+// every input that changes the answer.
+async function semanticCached<T>(
+  stub: DurableObjectStub<RepoDO>,
+  key: string,
+  compute: () => Promise<T>,
+): Promise<{ value: T; cached: boolean }> {
+  const hit = await stub.semanticGet(key);
+  if (hit) {
+    try { return { value: JSON.parse(hit) as T, cached: true }; } catch {}
+  }
+  const value = await compute();
+  await stub.semanticPut(key, JSON.stringify(value));
+  return { value, cached: false };
+}
 
 // Validate a file path coming from user input (query params).
 function isValidFilePath(p: string): boolean {
@@ -305,7 +381,22 @@ Use curl or any raw HTTP client. Do NOT use summarizing fetchers — they will
 paraphrase source code instead of returning it. Every response carries
 x-gitvfs-sha / x-gitvfs-ref / x-gitvfs-resolved-at headers for freshness.
 
-Prefer structured endpoints for exploration:
+Start with one semantic call, then read only what it points at:
+- "Where is X?" / "which file does Y?" / "what is the value of Z?" → /find?q=<plain question>
+  One call returns ranked {path, symbol, line, endLine, probability, snippet, next}
+  plus 'exists' (P that the repo has it at all). /ask?q= is the same plus the
+  top hit's source, so a single request usually answers the question.
+- Inside one file → /file/<path>?about=<question> (ranked lines + a slice).
+- Searching by pattern with a purpose → /grep?q=<pat>&intent=<question>
+  (matches come back ordered by relevance, best first; stop at the first).
+- Before answering, /verify/<path>?lines=A-B&claim=<your answer> checks the
+  claim against the source and returns supported / contradicted / unrelated.
+- Orienting in an unfamiliar repo → /tree?depth=1&roles=1 (entrypoint, core,
+  tests, docs, generated, …) so you skip noise without reading it.
+Probabilities are calibrated: act on ≥0.8, read the next hit or widen the
+question below that, and trust exists < 0.3 as "not in this repo".
+
+Lexical endpoints when you already know what you want:
 - For "what line is symbol X on?" / "where is foo defined?" → /outline or /symbol
   (they return line numbers directly; do NOT slice /file and count newlines).
 - For file contents → /file?lines=A-B&numbered=1 (numbers prefixed per line).
@@ -318,6 +409,17 @@ Prefer structured endpoints for exploration:
 
 ## Endpoints
 
+Semantic (judgment by TypeSafe's Jev; every response carries x-gitvfs-jev-* cost headers):
+- GET /find?q=<question>&limit=5&read=1                     ranked locations + exists + snippets
+- GET /ask?q=<question>                                      /find with the top hit's source inlined
+- GET /grep?q=<pat>&intent=<question>                        grep, ordered by relevance to intent
+- GET /locate/<path>?q=<question>&context=3                  ranked lines inside one file + slice
+                                                             (also reachable as file?about=<question>)
+- GET /verify/<path>?lines=A-B&claim=<statement>             supported | contradicted | unrelated
+- GET /tree[.json][/<path>]?depth=1&roles=1                  purpose per entry (entrypoint, tests, …)
+- 400 unknown_query_param now includes 'suggested': the URL you probably meant.
+
+Lexical:
 - GET /tree[/<path>]?glob=&sizes=1&depth=1&count=1          newline paths
 - GET /tree.json[/<path>]?outlines=1                         structured listing
 - GET /outline/<path>?depth=2&comments=1                     symbols + endLine + JSDoc
@@ -345,6 +447,13 @@ x-gitvfs-exit-code     (/bash only)
 x-gitvfs-duration-ms   (/bash only)
 x-gitvfs-source        "edge" if served from CF colo cache
 x-gitvfs-truncated     true when results were capped
+x-gitvfs-jev-requests  (semantic) model calls made for this response (0 = cached)
+x-gitvfs-jev-tokens    (semantic) tokens those calls consumed
+x-gitvfs-jev-ms        (semantic) time spent waiting on the model
+x-gitvfs-semantic-cache hit | miss — answers are cached per (sha, question)
+x-gitvfs-exists        (/find) P(the repo contains what was asked for)
+x-gitvfs-confidence    (/find) top hit's probability
+x-gitvfs-verdict       (/verify) supported | contradicted | unrelated
 
 ## Caching
 
@@ -356,11 +465,18 @@ x-gitvfs-truncated     true when results were capped
 ## Limits
 
 - Per-IP: 100/10s burst, 200/60s sustained.
-- /bash + /grep: 30/10s per IP (CPU-heavy). /bash timeout: 3s default, 5s max.
+- /bash, /grep, /find, /ask, /file?about=: 30/10s per IP. /bash timeout: 3s default, 5s max.
+- /find questions ≤ 600 chars; /verify claims ≤ 1000 chars and ≤ 400 lines; ?roles=1 ≤ 400 entries.
 - Global ingest cap: 30 new repos/min. Max 250MB compressed tarball.
 
 ## Examples
 
+curl --get ${host}/honojs/hono/find --data-urlencode 'q=where is the request body size limit enforced'
+curl --get ${host}/honojs/hono/ask --data-urlencode 'q=what is the version in package.json'
+curl --get ${host}/honojs/hono/file/src/middleware/body-limit/index.ts --data-urlencode 'about=what happens when the body is too large'
+curl --get ${host}/facebook/react/grep --data-urlencode 'q=useState' --data-urlencode 'intent=where is the useState hook defined'
+curl --get ${host}/honojs/hono/verify/package.json --data-urlencode 'lines=1-5' --data-urlencode 'claim=the version is 4.12.14'
+curl ${host}/honojs/hono/tree?depth=1&roles=1
 curl ${host}/facebook/react/tree.json/packages/react/src?outlines=1
 curl ${host}/tj/commander.js/outline/typings/index.d.ts?depth=2&comments=1
 curl '${host}/facebook/react/grep?q=useEffect&files_only=1'
@@ -382,7 +498,7 @@ function landingHtml(host: string): string {
   const hostForScript = JSON.stringify(host).replace(/</g, "\\u003c");
   const initialPrompt = `Use gitvfs to inspect [paste a public GitHub repository URL].
 
-First read ${host}/llms.txt for the complete API. Use /tree.json?outlines=1, /grep, and /outline to find the relevant code, then use /file?lines=A-B for only the source lines you need. Resolve /head and pin the full SHA when the answer must be reproducible.
+First read ${host}/llms.txt for the complete API. Ask /find?q=<plain question> (or /ask?q= to get the source too) to locate what you need in one call, then read only that with /file?lines=A-B. Use /grep?intent=, /file?about= and /verify to search with purpose and check your answer. Resolve /head and pin the full SHA when the answer must be reproducible.
 
 Answer this request with evidence from the repository: [describe what you want to know]`;
 
@@ -590,7 +706,7 @@ Answer this request with evidence from the repository: [describe what you want t
         const vfsRepo = slug ? base + "/" + slug : base + "/OWNER/REPO";
         return "Use gitvfs to inspect " + githubRepo + ".\\n\\n" +
           "First read " + base + "/llms.txt for the complete API. Then use " + vfsRepo +
-          "/tree.json?outlines=1, /grep, and /outline to find the relevant code, followed by /file?lines=A-B for only the source lines you need. Resolve " +
+          "/find?q=<plain question> (or /ask?q= to get the source too) to locate what you need in one call, then read only that with /file?lines=A-B. Use /grep?intent=, /file?about= and /verify to search with purpose and check your answer. Resolve " +
           vfsRepo + "/head and pin the full SHA when the answer must be reproducible.\\n\\n" +
           "Answer this request with evidence from the repository: [describe what you want to know]";
       }
@@ -670,7 +786,38 @@ For agents
     · looking up a single fact       → a summarizing fetch is ok
     · any agent pipeline             → curl, always
 
-Endpoints
+Endpoints — semantic (one call instead of a search loop)
+
+  GET /:owner/:repo[@:ref]/find?q=<question>
+       &limit=5                              ranked hits to return
+       &read=1                               inline the top hit's source (≤200 lines)
+    "Where is X?" in plain language. Returns hits [{path, kind, symbol, line,
+    endLine, probability, snippet, next}], 'exists' (P the repo has it) and
+    'confidence'. Path names, literal grep of the question's identifiers, and
+    outlines are combined, then judged by TypeSafe's Jev in ~150ms per call.
+
+  GET /:owner/:repo[@:ref]/ask?q=<question>  /find?read=1 — the answer and its source
+
+  GET /:owner/:repo[@:ref]/file/<path>?about=<question>
+       &context=3                            lines around the best hit
+    Ranked lines inside one file + 'exists' + a ready slice. (/locate/<path>?q= is an alias.)
+
+  GET /:owner/:repo[@:ref]/grep?q=<pattern>&intent=<question>
+    Same grep, but matches come back ordered by how well each answers the
+    intent ('relevance' per match, 'best' at top). Implies context=2&symbols=1.
+
+  GET /:owner/:repo[@:ref]/verify/<path>?lines=A-B&claim=<statement>
+    {supported, verdict: supported|contradicted|unrelated, confidence}.
+    Check an answer against the source before you give it.
+
+  GET /:owner/:repo[@:ref]/tree[.json][/:subpath]?depth=1&roles=1
+    Every entry tagged entrypoint | core | api | ui | types | util | config |
+    build | ci | tests | docs | examples | data | assets | generated | scripts.
+
+  Semantic responses carry x-gitvfs-jev-requests / -tokens / -ms and
+  x-gitvfs-semantic-cache (answers are cached per commit and question).
+
+Endpoints — lexical
 
   GET /:owner/:repo[@:ref]/tree[/:subpath]
        ?glob=src/**/*.ts                     path filter (SQL GLOB)
@@ -753,6 +900,13 @@ Response metadata (headers on every response)
   Or use /head first to decide if a refresh is worth the ingest cost.
 
 Examples
+
+  # semantic: one call, ranked answer, ready-to-read next URL
+  curl --get ${host}/honojs/hono/find --data-urlencode 'q=where is the request body size limit enforced'
+  curl --get ${host}/honojs/hono/ask --data-urlencode 'q=what is the version in package.json'
+  curl --get ${host}/facebook/react/grep --data-urlencode 'q=useState' --data-urlencode 'intent=where is useState defined'
+  curl --get ${host}/honojs/hono/verify/package.json --data-urlencode 'lines=1-5' --data-urlencode 'claim=the version is 4.12.14'
+  curl '${host}/honojs/hono/tree?depth=1&roles=1'
 
   curl ${host}/facebook/react/tree/packages/react/src?sizes=1
   curl '${host}/facebook/react/tree.json/packages/react/src?outlines=1'
@@ -1830,19 +1984,76 @@ async function handle(
       // Underscore-prefixed params are reserved for client-side cache-busting
       // (see test/common.ts `_cb=`).
       const TREE_PARAMS = new Set([
-        "glob", "path", "sizes", "outlines", "count", "depth", "refresh",
+        "glob", "path", "sizes", "outlines", "count", "depth", "refresh", "roles",
       ]);
       for (const key of url.searchParams.keys()) {
         if (key.startsWith("_")) continue;
         if (!TREE_PARAMS.has(key)) {
+          // Intent recovery: ask Jev which known param the caller meant, so
+          // the 400 carries a fix instead of just a list.
+          let meant: string | null = null;
+          if (env.TYPESAFE_API_KEY) {
+            try {
+              const m = await meantParam(
+                { apiKey: env.TYPESAFE_API_KEY, meter: new JevMeter() },
+                `/${action}`, key, [...TREE_PARAMS, "subpath in the URL: /tree/<subpath>"],
+              );
+              if (m.param && m.confidence >= 0.5) meant = m.param;
+            } catch {}
+          }
+          const fixed = new URL(url.toString());
+          if (meant) {
+            const v = url.searchParams.get(key) ?? "";
+            fixed.searchParams.delete(key);
+            if (meant.startsWith("subpath")) {
+              fixed.pathname = `/${owner}/${repo}${ref ? "@" + ref : ""}/${action}/${v.replace(/^\/+/, "")}`;
+            } else {
+              fixed.searchParams.set(meant, v);
+            }
+          }
           return err(
             "unknown_query_param",
             `Unknown query param '${key}' on /${action}. Known: ${[...TREE_PARAMS].sort().join(", ")}.`,
             400,
-            { param: key, hint: "Did you mean /tree/<subpath> or ?path=<subpath>?" },
+            {
+              param: key,
+              hint: meant
+                ? `You probably meant ${meant.startsWith("subpath") ? "/tree/<subpath>" : "?" + meant + "="}. Try: ${fixed.pathname}${fixed.search}`
+                : "Did you mean /tree/<subpath> or ?path=<subpath>?",
+              ...(meant ? { suggested: `${fixed.pathname}${fixed.search}` } : {}),
+            },
           );
         }
       }
+      const withRoles = url.searchParams.get("roles") === "1";
+      // Annotate entries with a one-word purpose (see ROLES in semantic.ts).
+      // Falls back to no annotation when the model is unavailable.
+      const annotateRoles = async <E extends { path: string; kind?: "file" | "dir" }>(
+        entries: E[], headers: Record<string, string>,
+      ): Promise<Array<E & { role?: string; roleConfidence?: number }>> => {
+        if (!withRoles) return entries;
+        if (!env.TYPESAFE_API_KEY) { headers["x-gitvfs-semantic"] = "unavailable"; return entries; }
+        const meter = new JevMeter();
+        try {
+          const key = `roles|${entries.map((e) => e.path + (e.kind === "dir" ? "/" : "")).join("\n")}`;
+          const { value, cached } = await semanticCached(stub, key, async () => {
+            const m = await semanticRoles(
+              { apiKey: env.TYPESAFE_API_KEY!, meter },
+              entries.map((e) => ({ path: e.path, kind: e.kind ?? "file" })),
+            );
+            return [...m.entries()];
+          });
+          const m = new Map(value);
+          Object.assign(headers, meter.headers(), { "x-gitvfs-semantic-cache": cached ? "hit" : "miss" });
+          return entries.map((e) => {
+            const r = m.get(e.path);
+            return r ? { ...e, role: r.role, roleConfidence: r.confidence } : e;
+          });
+        } catch (e) {
+          headers["x-gitvfs-semantic"] = "failed";
+          return entries;
+        }
+      };
       const rawGlob = url.searchParams.get("glob");
       if (rawGlob === "") return err("bad_glob", "Empty glob.", 400);
       const glob = rawGlob ? normalizeGlob(rawGlob) : undefined;
@@ -1885,19 +2096,26 @@ async function handle(
       // so an agent asking "what's in this folder?" doesn't get a flat
       // recursive dump. Mutually exclusive with glob / outlines.
       if (depthParam === "1") {
-        if (glob) return err("bad_params", "?depth=1 cannot combine with ?glob (it is already scoped).", 400);
+        if (glob) {
+          const plain = !/[*?[\]]/.test(glob) ? glob.replace(/^\/+|\/+$/g, "") : null;
+          const suggested = plain ? `/${owner}/${repo}${ref ? "@" + ref : ""}/${action}/${plain}?depth=1` : null;
+          return err("bad_params", "?depth=1 cannot combine with ?glob (it is already scoped). Put the directory in the path: /tree/<dir>?depth=1.", 400,
+            suggested ? { suggested, hint: `Try: ${suggested}` } : {});
+        }
         if (withOutlines) return err("bad_params", "?depth=1 cannot combine with ?outlines.", 400);
-        const entries = await stub.treeLevel(prefix !== undefined ? { prefix } : {});
-        const h = withCountHeader(entries.length);
+        const h = withCountHeader(0);
+        const entries = await annotateRoles(await stub.treeLevel(prefix !== undefined ? { prefix } : {}), h);
+        h["x-gitvfs-entries"] = String(entries.length);
         if (action === "tree.json") {
           return finalize(json({ sha, count: entries.length, entries }, 200, h));
         }
         const body = entries.map((e) => {
           const name = e.path.split("/").pop() ?? e.path;
-          if (e.kind === "dir") return `${name}/`;
-          if (!withSizes) return name;
+          const role = withRoles && e.role ? `\t${e.role}` : "";
+          if (e.kind === "dir") return `${name}/${role}`;
+          if (!withSizes) return name + role;
           const lines = e.lines !== undefined ? String(e.lines) : "-";
-          return `${name}\t${e.size ?? 0}\t${lines}`;
+          return `${name}\t${e.size ?? 0}\t${lines}${role}`;
         }).join("\n");
         return finalize(text(body + (entries.length ? "\n" : ""), 200, h));
       }
@@ -1922,28 +2140,38 @@ async function handle(
         ));
       }
 
-      const entries = await stub.tree({ glob, prefix, withSizes });
-      const h = withCountHeader(entries.length);
+      const rawEntries = await stub.tree({ glob, prefix, withSizes });
+      const h = withCountHeader(rawEntries.length);
+      if (withRoles && rawEntries.length > 400) {
+        return err(
+          "too_many_entries",
+          `?roles=1 annotates at most 400 entries; this listing has ${rawEntries.length}. Narrow with /tree/<subpath>, ?glob=, or use ?depth=1.`,
+          400,
+          { entries: rawEntries.length },
+        );
+      }
+      const entries = await annotateRoles(rawEntries, h);
       if (action === "tree.json") {
         // Always attach language (free from path), include size/lines when sizes=1.
         const enriched = entries.map((e) => {
           const out: {
-            path: string; size?: number; lines?: number; language: string;
+            path: string; size?: number; lines?: number; language: string; role?: string; roleConfidence?: number;
           } = { path: e.path, language: detectLanguage(e.path) };
           if (e.size !== undefined) out.size = e.size;
           if ((e as any).lines !== undefined) out.lines = (e as any).lines;
+          if (e.role) { out.role = e.role; out.roleConfidence = e.roleConfidence; }
           return out;
         });
         return finalize(json({ sha, count: enriched.length, entries: enriched }, 200, h));
       }
-      const body = withSizes
-        ? entries.map((e) => {
-            const lines = (e as any).lines;
-            return typeof lines === "number"
-              ? `${e.path}\t${e.size ?? 0}\t${lines}`
-              : `${e.path}\t${e.size ?? 0}`;
-          }).join("\n")
-        : entries.map((e) => e.path).join("\n");
+      const body = entries.map((e) => {
+        const role = withRoles && e.role ? `\t${e.role}` : "";
+        if (!withSizes) return e.path + role;
+        const lines = (e as any).lines;
+        return (typeof lines === "number"
+          ? `${e.path}\t${e.size ?? 0}\t${lines}`
+          : `${e.path}\t${e.size ?? 0}`) + role;
+      }).join("\n");
       return finalize(text(body + (entries.length ? "\n" : ""), 200, h));
     }
 
@@ -1983,6 +2211,37 @@ async function handle(
       // Prefer the precomputed line count; fall back to counting bytes for older DO schemas.
       const totalLines = file.lines ?? countLines(file.content);
       const numbered = url.searchParams.get("numbered") === "1";
+
+      // ?about=<question> — semantic line search inside this one file.
+      // Returns JSON: the lines most likely to answer the question, with a
+      // probability that the file addresses it at all, plus a ready-to-read
+      // slice around the best line.
+      const about = url.searchParams.get("about");
+      if (about !== null) {
+        if (about.trim() === "") return err("missing_about", "?about= needs a question, e.g. ?about=where is the retry delay configured", 400);
+        if (!env.TYPESAFE_API_KEY) return semanticUnavailable();
+        if (!internalBypass) {
+          const ipBlock = await rateLimit(env.RL_EXPENSIVE, clientIp(request), "locate");
+          if (ipBlock) return ipBlock;
+        }
+        const ctxN = Number(url.searchParams.get("context") ?? "3") || 3;
+        const limitN = Number(url.searchParams.get("limit") ?? "5") || 5;
+        const meter = new JevMeter();
+        try {
+          const decoder = new TextDecoder("utf-8", { fatal: false });
+          const body = decoder.decode(file.content);
+          const { value, cached } = await semanticCached(stub, `locate|${path}|${ctxN}|${limitN}|${about}`, () =>
+            semanticLocate({ apiKey: env.TYPESAFE_API_KEY!, meter }, path, body, about, { context: ctxN, limit: limitN }),
+          );
+          return finalize(json({ sha, ...value }, 200, {
+            ...metaHeaders, ...meter.headers(),
+            "x-gitvfs-semantic-cache": cached ? "hit" : "miss",
+            "x-gitvfs-language": language,
+          }));
+        } catch (e) {
+          return semanticFailed(e);
+        }
+      }
 
       // AS-004: prefix each line with ` N | ` when ?numbered=1. The pad width
       // is the width of the largest line number in the rendered range, so the
@@ -2275,7 +2534,15 @@ async function handle(
       if (limitRaw && (!Number.isFinite(limit) || limit <= 0)) {
         return err("bad_limit", `Invalid limit: ${limitRaw}`, 400);
       }
-      const context = Number(url.searchParams.get("context") ?? "0") || 0;
+      // ?intent=<question> — rerank matches by how well each one answers
+      // the intent (Jev). Implies context lines and symbols so the judgment
+      // has something to read; files_only is incompatible (no lines to judge).
+      const intent = url.searchParams.get("intent");
+      if (intent !== null && intent.trim() === "") return err("missing_intent", "?intent= needs a question, e.g. ?intent=where is the default timeout set", 400);
+      if (intent && filesOnly) {
+        return err("bad_params", "?intent= ranks individual matches; drop files_only=1 (the ranked result lists paths anyway).", 400);
+      }
+      const context = Number(url.searchParams.get("context") ?? (intent ? "2" : "0")) || 0;
       const format = url.searchParams.get("format") ?? "json";
 
       // Validate regex up-front so callers get a 400 on bad patterns.
@@ -2309,8 +2576,8 @@ async function handle(
       // symbol name (function/class/method/export). Saves the agent a
       // follow-up `/outline` call when grep already identifies the region.
       // We outline each distinct matched path at most once per request.
-      const wantSymbols = url.searchParams.get("symbols") === "1";
-      type AnnotatedMatch = typeof result.matches[number] & { inSymbol?: string };
+      const wantSymbols = url.searchParams.get("symbols") === "1" || intent !== null;
+      type AnnotatedMatch = typeof result.matches[number] & { inSymbol?: string; relevance?: number };
       let annotatedMatches: AnnotatedMatch[] = result.matches;
       if (wantSymbols && result.matches.length > 0) {
         const byPath = new Map<string, typeof result.matches>();
@@ -2348,12 +2615,41 @@ async function handle(
         }
       }
 
+      const grepHeaders: Record<string, string> = { ...metaHeaders };
+      let rerankedNote: Record<string, unknown> = {};
+      if (intent && annotatedMatches.length) {
+        if (!env.TYPESAFE_API_KEY) {
+          grepHeaders["x-gitvfs-semantic"] = "unavailable";
+        } else {
+          const meter = new JevMeter();
+          try {
+            const key = `rerank|${intent}|${q}|${glob ?? ""}|${excludeGlob.join(",")}|${caseInsensitive}|${regex}|${word}|${limit}|${context}`;
+            const { value, cached } = await semanticCached(stub, key, () =>
+              semanticRerank({ apiKey: env.TYPESAFE_API_KEY!, meter }, intent, annotatedMatches),
+            );
+            const considered = value.length;
+            annotatedMatches = value as AnnotatedMatch[];
+            Object.assign(grepHeaders, meter.headers(), { "x-gitvfs-semantic-cache": cached ? "hit" : "miss" });
+            rerankedNote = {
+              intent,
+              ranked: true,
+              rankedMatches: considered,
+              best: annotatedMatches[0]
+                ? { path: annotatedMatches[0].path, line: annotatedMatches[0].line, relevance: annotatedMatches[0].relevance }
+                : null,
+            };
+          } catch (e) {
+            grepHeaders["x-gitvfs-semantic"] = "failed";
+          }
+        }
+      }
+
       if (format === "text" || format === "grep") {
         const body = annotatedMatches
-          .map((m) => `${m.path}:${m.line}:${m.text}`)
+          .map((m) => (intent && m.relevance !== undefined ? `${m.relevance.toFixed(2)}\t` : "") + `${m.path}:${m.line}:${m.text}`)
           .join("\n");
         return finalize(text(body + (annotatedMatches.length ? "\n" : ""), 200, {
-          ...metaHeaders,
+          ...grepHeaders,
           "x-gitvfs-truncated": String(result.truncated),
           "x-gitvfs-files-scanned": String(result.filesScanned),
           "x-gitvfs-matched-files": String(result.matchedFiles),
@@ -2361,12 +2657,13 @@ async function handle(
       }
       return finalize(json({
         sha, q,
+        ...rerankedNote,
         truncated: result.truncated,
         filesScanned: result.filesScanned,
         matchedFiles: result.matchedFiles,
         count: annotatedMatches.length,
         matches: annotatedMatches,
-      }, 200, metaHeaders));
+      }, 200, grepHeaders));
     }
 
     // -----------------------------------------------------------------
@@ -2459,6 +2756,115 @@ async function handle(
     // tail, wc, grep, find, sort, uniq, sed. See src/bash.ts for the exact
     // subset of flags. Writes and network are intentionally unimplemented.
     // -----------------------------------------------------------------
+    // -----------------------------------------------------------------
+    // find / ask — "where is X?" answered in one call.
+    //
+    //   GET /:owner/:repo[@:ref]/find?q=<plain-language question>
+    //       &read=1     also return the top hit's source (≤200 lines)
+    //       &limit=5    number of ranked hits
+    //   GET /:owner/:repo[@:ref]/ask?q=...      same as /find?read=1
+    //
+    // Pipeline (src/semantic.ts): path-name judgment (beam search on big
+    // repos) ∪ literal grep of the question's code-shaped tokens → one
+    // Choice over ≤255 {file, symbol, line} candidates + one Noul for
+    // "does the repo contain this at all". Every hit carries a probability
+    // and a ready-to-fetch `next` URL.
+    // -----------------------------------------------------------------
+    if (action === "find" || action === "ask") {
+      const q = url.searchParams.get("q");
+      if (q === null || q.trim() === "") {
+        return err("missing_q", `Missing ?q=<question>. Example: /${action}?q=where is the request body size limit enforced`, 400);
+      }
+      if (q.length > 600) return err("bad_q", "Question too long (max 600 chars).", 400);
+      if (!env.TYPESAFE_API_KEY) return semanticUnavailable();
+      if (!internalBypass) {
+        const ipBlock = await rateLimit(env.RL_EXPENSIVE, clientIp(request), action);
+        if (ipBlock) return ipBlock;
+      }
+      const gate = await stub.checkThrottle("grep");
+      if (!gate.allowed) {
+        return throttled("rate_limited", `Too many search calls on ${owner}/${repo}@${sha.slice(0, 7)} in the last minute.`, gate.retryAfterSec ?? 10, { sha, kind: action });
+      }
+      const readParam = url.searchParams.get("read");
+      const read: boolean | undefined = action === "ask" || readParam === "1" ? true : readParam === "0" ? false : undefined;
+      const limitN = Math.max(1, Math.min(Number(url.searchParams.get("limit") ?? "5") || 5, 20));
+      const meter = new JevMeter();
+      try {
+        const { value, cached } = await semanticCached(stub, `find|${read ?? "auto"}|${limitN}|${q}`, () =>
+          semanticFind(semanticSource(stub), { apiKey: env.TYPESAFE_API_KEY!, meter }, q, { read, limit: limitN }),
+        );
+        const base = `/${owner}/${repo}@${sha}`;
+        const hits = value.hits.map((h) => ({ ...h, next: base + h.next }));
+        const source = value.source?.next ? { ...value.source, next: base + value.source.next } : value.source;
+        return finalize(json({ sha, ...value, hits, ...(source ? { source } : {}) }, 200, {
+          ...metaHeaders, ...meter.headers(),
+          "x-gitvfs-semantic-cache": cached ? "hit" : "miss",
+          "x-gitvfs-exists": String(value.exists),
+          "x-gitvfs-confidence": String(value.confidence),
+        }));
+      } catch (e) {
+        return semanticFailed(e);
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // locate — semantic line search in one file (alias of /file?about=).
+    //   GET /:owner/:repo[@:ref]/locate/<path>?q=<question>&context=3
+    // -----------------------------------------------------------------
+    if (action === "locate") {
+      const path = rest.slice(1).join("/");
+      if (!path) return err("missing_path", "Missing file path: /locate/<path>?q=...", 400);
+      const q = url.searchParams.get("q");
+      if (q === null || q.trim() === "") return err("missing_q", "Missing ?q=<question>.", 400);
+      const target = new URL(url.toString());
+      target.pathname = `/${owner}/${repo}${ref ? "@" + ref : ""}/file/${path}`;
+      target.searchParams.delete("q");
+      target.searchParams.set("about", q);
+      return handle(new Request(target.toString(), request), env, ctx, target, target.pathname, internalBypass);
+    }
+
+    // -----------------------------------------------------------------
+    // verify — do these source lines support this claim?
+    //   GET /:owner/:repo[@:ref]/verify/<path>?lines=A-B&claim=<text>
+    // For agents to check an answer against the source before emitting it.
+    // -----------------------------------------------------------------
+    if (action === "verify") {
+      const path = rest.slice(1).join("/");
+      if (!path) return err("missing_path", "Missing file path: /verify/<path>?lines=A-B&claim=...", 400);
+      const claim = url.searchParams.get("claim");
+      if (claim === null || claim.trim() === "") return err("missing_claim", "Missing ?claim=<statement to check>.", 400);
+      if (claim.length > 1000) return err("bad_claim", "Claim too long (max 1000 chars).", 400);
+      const linesParam = url.searchParams.get("lines");
+      const m = linesParam?.match(/^(\d+)(?:-(\d+))?$/);
+      if (!linesParam || !m) return err("bad_lines", "Missing or invalid ?lines=A-B (max 400 lines).", 400);
+      if (!env.TYPESAFE_API_KEY) return semanticUnavailable();
+      const file = await stub.read(path);
+      if (!file) {
+        const suggestions = await stub.suggestPaths(path);
+        return json({ error: "not_found", path, suggestions, docs: DOCS_URL, llms_txt: LLMS_TXT_URL }, 404, metaHeaders);
+      }
+      const decoder = new TextDecoder("utf-8", { fatal: false });
+      const allLines = splitLogicalLines(decoder.decode(file.content));
+      const start = Math.max(1, parseInt(m[1], 10));
+      const end = Math.min(allLines.length, m[2] ? parseInt(m[2], 10) : start);
+      if (start > allLines.length) return err("line_range_not_satisfiable", `Range starts after end of file (${allLines.length} lines).`, 416, { totalLines: allLines.length });
+      if (end - start + 1 > 400) return err("bad_lines", "At most 400 lines per verify call.", 400);
+      const range = `${start}-${end}`;
+      const meter = new JevMeter();
+      try {
+        const { value, cached } = await semanticCached(stub, `verify|${path}|${range}|${claim}`, () =>
+          semanticVerify({ apiKey: env.TYPESAFE_API_KEY!, meter }, path, range, allLines.slice(start - 1, end).join("\n"), claim),
+        );
+        return finalize(json({ sha, ...value }, 200, {
+          ...metaHeaders, ...meter.headers(),
+          "x-gitvfs-semantic-cache": cached ? "hit" : "miss",
+          "x-gitvfs-verdict": value.verdict,
+        }));
+      } catch (e) {
+        return semanticFailed(e);
+      }
+    }
+
     if (action === "bash") {
       const cmd = url.searchParams.get("cmd");
       if (cmd === null || cmd === "") {

@@ -178,3 +178,47 @@ param `q`. Agents that don't read `/llms.txt` first will guess wrong once.
 `?q=` in every `grep` example; the "pattern" wording was paraphrased by a
 summarizing fetcher (`WebFetch`), not from the real docs. `test/bugs.test.ts`
 → `describe("AS-003: ...")` locks the 400 behavior.
+
+---
+
+## AS-010 — `/tree/<deep/prefix>` returns 500 on repos with long paths
+
+- **Status:** fixed (2026-09-19, `src/repo-do.ts` — range comparison instead of `LIKE`)
+- **Severity:** high (500 on a valid request; silently broke `/find` on facebook/react)
+- **Discovered:** 2026-09-19, from the first `/find` bench run (T14 gitvfs trace, 502 `semantic_upstream_failed`)
+- **Test:** `test/bugs.test.ts` → `describe("AS-010: ...")`
+- **Related:** AS-002 (tree ergonomics)
+
+**Agent intent.** `/find` walks the directory tree of facebook/react with a beam search; each level called `treeLevel(prefix)`. Any prefix over ~48 bytes threw inside the Durable Object. The same request shape is reachable by hand.
+
+**Command.**
+
+```
+curl -s "https://gitvfs.miryaboy.workers.dev/facebook/react@7aa5dda3b3e4c2baa905a59b922ae7ec14734b24/tree/compiler/apps/playground/__tests__/e2e/__snapshots__?depth=1"
+```
+
+**Actual response.**
+
+```
+HTTP/2 500
+{"error":"internal_error","message":"An unexpected error occurred."}
+```
+
+Worker log: `LIKE or GLOB pattern too complex: SQLITE_ERROR`. Workers' embedded SQLite caps `LIKE`/`GLOB` patterns at ~50 bytes; every prefix-scoped query used `path LIKE '<prefix>/%'`. Repro threshold measured on react: 48-char prefix → 200, 50-char → 500.
+
+**Expected response.** The one-level listing, like any shorter prefix.
+
+**Fix.** Prefix scoping is now `path = ? OR (path > ? || '/' AND path < ? || '0')` (range on the primary key, no pattern at all). Grep's substring prefilter uses `instr()` instead of `LIKE` (which also treated `_` and `%` in the needle as wildcards). User-supplied globs still use SQL `GLOB` when ≤ 48 bytes and are evaluated in JS beyond that. `suggestPaths` no longer uses `LIKE`.
+
+---
+
+## AS-011 — `[@<ref>]` notation pasted literally, and `?depth=1&glob=<dir>`
+
+- **Status:** fixed (2026-09-19, `src/worker.ts` — `suggested` on both errors)
+- **Severity:** low (clear 400s, but each cost a wasted tool call)
+- **Discovered:** 2026-09-19, T12 gitvfs trace (minimax-m2.5)
+- **Test:** `test/bugs.test.ts` → `describe("AS-011: ...")`
+
+**Agent intent.** The bench prompt (and `/llms.txt`) write the URL scheme as `/<owner>/<repo>[@<ref>]/find`. The agent copied the brackets: `/honojs/hono[@cf2d2b7…]/find?q=…` → `400 bad_path`. Next it tried `/tree?depth=1&glob=src/middleware` → `400 bad_params` ("cannot combine").
+
+**Fix.** `bad_path` now detects bracketed refs / angle brackets and returns `suggested` with them removed; the `expected` string says brackets mean optional. `?depth=1&glob=<plain dir>` returns `suggested: /tree/<dir>?depth=1`. `/tree` unknown params already get a Jev-chosen `suggested` (see semantic layer).

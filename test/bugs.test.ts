@@ -461,3 +461,69 @@ describe("ref_not_found is 404, not 500", () => {
     expect(body.error).toBe("ref_not_found");
   });
 });
+
+// AS-010 — deep prefixes must not hit SQLite's ~50-byte LIKE/GLOB pattern cap.
+describe("AS-010: long prefixes, literals, and globs work (no LIKE pattern cap)", () => {
+  const REACT = "facebook/react@7aa5dda3b3e4c2baa905a59b922ae7ec14734b24";
+  const DEEP = "compiler/packages/babel-plugin-react-compiler/src/__tests__/fixtures/compiler";
+  test("/tree/<70-char prefix>?depth=1 returns 200 with entries", async () => {
+    const { status, body } = await getText(`/${REACT}/tree/${DEEP}?depth=1`);
+    expect(status).toBe(200);
+    expect(body.split("\n").filter(Boolean).length).toBeGreaterThan(5);
+  });
+  test("/tree/<deep prefix>?count=1 and flat listing agree", async () => {
+    const c = await getText(`/${REACT}/tree/${DEEP}?count=1`);
+    expect(c.status).toBe(200);
+    const n = Number(c.body.trim());
+    expect(n).toBeGreaterThan(5);
+    const t = await getText(`/${REACT}/tree/${DEEP}`);
+    expect(t.body.split("\n").filter(Boolean).length).toBe(n);
+  });
+  test("/outline/<deep dir> works", async () => {
+    const { status, body } = await getJson(`/${REACT}/outline/${DEEP}/propagate-scope-deps-hir-fork`);
+    expect(status).toBe(200);
+    expect(body.kind).toBe("directory");
+  });
+  test("grep with a literal longer than 50 chars works", async () => {
+    const q = encodeURIComponent("Body Limit Middleware for Hono. This middleware is not there");
+    const { status } = await getJson(`/${TEST_REPO}/grep?q=${q}`);
+    expect(status).toBe(200);
+  });
+  test("grep with a 60-char literal that exists finds it", async () => {
+    const OPENCODE = "sst/opencode@8cc2c81d57f7c3ca8942d0e2461bc676bd25e8cc";
+    const q = encodeURIComponent("4 out of 5 people on our team love using ");
+    const { status, body } = await getJson(`/${OPENCODE}/grep?q=${q}&limit=5`);
+    expect(status).toBe(200);
+    expect(body.matches.some((m: any) => m.path.endsWith("zen/index.tsx"))).toBe(true);
+  });
+  test("grep needle with `_` is literal, not a LIKE wildcard", async () => {
+    const { status, body } = await getJson(`/${REACT}/grep?q=${encodeURIComponent("__DEV__ && console.error")}&limit=5`);
+    expect(status).toBe(200);
+    for (const m of body.matches) expect(m.text).toContain("__DEV__");
+  });
+  test("a glob longer than 48 bytes is honoured (JS fallback)", async () => {
+    const glob = encodeURIComponent(`${DEEP}/propagate-scope-deps-hir-fork/**/*.js`);
+    const { status, body } = await getText(`/${REACT}/tree?glob=${glob}&count=1`);
+    expect(status).toBe(200);
+    expect(Number(body.trim())).toBeGreaterThan(0);
+    const g2 = await getJson(`/${REACT}/grep?q=function&glob=${glob}&limit=3`);
+    expect(g2.status).toBe(200);
+    for (const m of g2.body.matches) expect(m.path).toStartWith(`${DEEP}/propagate-scope-deps-hir-fork/`);
+  });
+});
+
+// AS-011 — bracketed optional-ref notation and depth+glob get a `suggested` URL.
+describe("AS-011: bad_path and depth+glob errors carry a suggested URL", () => {
+  test("/owner/repo[@sha]/find is 400 with the de-bracketed URL", async () => {
+    const { status, body } = await getJson(`/${TEST_REPO}[@main]/tree?count=1`);
+    expect(status).toBe(400);
+    expect(body.error).toBe("bad_path");
+    expect(body.suggested).toContain(`/${TEST_REPO}@main/tree`);
+  });
+  test("?depth=1&glob=<dir> suggests /tree/<dir>?depth=1", async () => {
+    const { status, body } = await getJson(`/${TEST_REPO}/tree?depth=1&glob=src`);
+    expect(status).toBe(400);
+    expect(body.error).toBe("bad_params");
+    expect(body.suggested).toBe(`/${TEST_REPO}/tree/src?depth=1`);
+  });
+});
