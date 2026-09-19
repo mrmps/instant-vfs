@@ -69,6 +69,15 @@ type = "ratelimit"
 namespace_id = "1004"
 simple = { limit = 30, period = 60 }
 
+# --- Embedding model weights (R2) -----------------------------------------
+# minishlab/potion-code-16M-v2 exported by bench/export-model.py as a 17MB
+# int8 file. Loaded once per isolate by src/embed.ts and shared by every
+# RepoDO on it. Upload with:
+#   wrangler r2 object put gitvfs-models/potion-code-16M-v2.m2v --file potion-code-16M-v2.m2v
+[[r2_buckets]]
+binding = "MODELS"
+bucket_name = "gitvfs-models"
+
 # --- Metrics (Workers Analytics Engine) ----------------------------------
 # Per-request data point: blobs=[action, source, status], doubles=[durationMs],
 # indexes=[action]. Also writes an ingest-failure point on ingest_too_large.

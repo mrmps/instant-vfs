@@ -32,6 +32,10 @@ export interface Source {
     files?: string[];
     matches: Array<{ path: string; line: number; text: string; before?: string[]; after?: string[] }>;
   }>;
+  // Optional hybrid (embedding + BM25) search over indexed chunks. Absent or
+  // returning [] when the index is not ready; find() then relies on the
+  // other stages.
+  search?(q: string, k: number): Promise<Array<{ path: string; start: number; end: number; symbol: string | null; kind: string; snippet: string }>>;
 }
 
 export type Ctx = { apiKey: string; meter: JevMeter };
@@ -114,7 +118,7 @@ export function planQuery(q: string): QueryPlan {
 
 export type FindHit = {
   path: string;
-  kind: "file" | "symbol" | "match";
+  kind: "file" | "symbol" | "match" | "chunk";
   symbol?: string;
   symbolKind?: string;
   signature?: string;
@@ -135,6 +139,7 @@ export type FindResult = {
   stages: {
     paths: { total: number; considered: number; requests: number };
     grep: { literals: string[]; identifiers: string[]; files: number; error?: string };
+    search?: { chunks: number; files: number };
     final: { candidates: number; deepened?: number };
   };
   // Present when read=1, or automatically when the top hit is ≥ FIND_AUTO_READ_MIN_P.
@@ -144,7 +149,7 @@ export type FindResult = {
 type Candidate = {
   id: string;
   path: string;
-  kind: "file" | "symbol" | "match";
+  kind: "file" | "symbol" | "match" | "chunk";
   symbol?: string;
   symbolKind?: string;
   signature?: string;
@@ -161,6 +166,7 @@ const FIND_BEAM_MIN_P = 0.06;
 const FIND_BEAM_MAX_LEVELS = 8;
 const FIND_PATH_KEEP = 10;           // files kept from the path stage
 const FIND_PATH_HITS = 12;           // files whose path literally contains a question term
+const FIND_SEARCH_K = 12;            // hybrid-search chunks folded in as candidates
 const FIND_GREP_FILES = 14;          // files kept from the grep stage
 const FIND_SYMBOLS_PER_FILE = 40;
 const FIND_MATCHES_PER_FILE = 3;
@@ -349,12 +355,13 @@ export async function find(
 ): Promise<FindResult> {
   const plan = planQuery(q);
   let grepError: string | undefined;
-  const [paths, greps] = await Promise.all([
+  const [paths, greps, searched] = await Promise.all([
     pathStage(src, ctx, q),
     grepStage(src, plan).catch((e: any) => {
       grepError = e?.message ?? String(e);
       return { files: [], matches: new Map<string, Array<{ line: number; text: string }>>() };
     }),
+    src.search ? src.search(q, FIND_SEARCH_K).catch(() => []) : Promise.resolve([]),
   ]);
 
   // Lexical path hits: any path whose segments contain a question term
@@ -378,10 +385,16 @@ export async function find(
     pathHits.sort((a, b) => b.score - a.score || a.path.length - b.path.length);
   }
 
-  // Merge candidate files, prioritising ones both stages agree on.
+  // Merge candidate files, prioritising ones both stages agree on. Hybrid
+  // search hits count as "grep" evidence (content-based, not name-based).
   const fileSet = new Map<string, Set<"path" | "grep">>();
   for (const f of paths.files) fileSet.set(f.path, new Set(["path"]));
   for (const f of pathHits.slice(0, FIND_PATH_HITS)) if (!fileSet.has(f.path)) fileSet.set(f.path, new Set(["path"]));
+  for (const h of searched) {
+    const s = fileSet.get(h.path) ?? new Set();
+    s.add("grep");
+    fileSet.set(h.path, s);
+  }
   for (const f of greps.files) {
     const s = fileSet.get(f.path) ?? new Set();
     s.add("grep");
@@ -413,6 +426,13 @@ export async function find(
         });
       }
     }
+    for (const h of searched.filter((x) => x.path === f.path)) {
+      // Symbol chunks coincide with outline symbols already listed; window
+      // chunks are new evidence with their first lines as text.
+      if (h.kind === "symbol" && candidates.some((c) => c.path === f.path && c.kind === "symbol" && c.line === h.start)) continue;
+      const head = h.snippet.split("\n").map((l) => l.replace(/^\s*\d+ \| /, "").trim()).filter(Boolean).slice(0, 3).join(" ⏎ ");
+      candidates.push({ id: "", path: f.path, kind: "chunk", symbol: h.symbol ?? undefined, line: h.start, endLine: h.end, text: head.slice(0, 200), via });
+    }
     for (const m of greps.matches.get(f.path) ?? []) {
       // A grep hit on a symbol's own line is the same location: fold it in.
       const sym = candidates.find((c) => c.path === f.path && c.kind === "symbol" && c.line === m.line);
@@ -436,6 +456,7 @@ export async function find(
       paths: { total: paths.total, considered: paths.considered, requests: paths.requests },
       grep: { literals: plan.literals, identifiers: plan.identifiers, files: greps.files.length, ...(grepError ? { error: grepError } : {}) },
       final: { candidates: trimmed.length },
+      ...(searched.length ? { search: { chunks: searched.length, files: new Set(searched.map((h) => h.path)).size } } : {}),
     },
   };
   if (!trimmed.length) return empty;
@@ -449,6 +470,7 @@ export async function find(
         return `${c.id}| ${c.symbolKind ?? "symbol"} ${c.symbol} in ${c.path}:${c.line}` +
           (c.signature ? ` — ${c.signature.slice(0, 120)}` : c.text ? ` — ${c.text.trim().slice(0, 120)}` : "");
       }
+      if (c.kind === "chunk") return `${c.id}| lines ${c.line}-${c.endLine} of ${c.path}${c.symbol ? ` (${c.symbol})` : ""}: ${c.text}`;
       return `${c.id}| line ${c.line} of ${c.path}: ${c.text}`;
     });
     const r = await jev(ctx.apiKey, lines.join("\n"), {
@@ -528,7 +550,7 @@ export async function find(
     if (text !== undefined && c.line) {
       const ls = splitLogicalLines(text);
       const start = c.line;
-      const end = Math.min(ls.length, c.kind === "match" ? c.line : Math.min(c.endLine ?? c.line + 5, c.line + 5));
+      const end = Math.min(ls.length, c.kind === "match" ? c.line : Math.min(c.endLine ?? c.line + 5, c.line + (c.kind === "chunk" ? 8 : 5)));
       snippet = ls.slice(start - 1, end).map((L, i) => `${start + i} | ${L}`).join("\n");
     }
     const range = c.line

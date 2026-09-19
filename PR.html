@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Semantic endpoints · instant-vfs</title>
+    <title>Hybrid code search · instant-vfs</title>
     <style>
       :root { color-scheme: light; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f6f8; color: #17202a; }
       * { box-sizing: border-box; }
@@ -11,9 +11,8 @@
       main { max-width: 1180px; margin: 0 auto; }
       header { margin-bottom: 24px; }
       h1, h2, h3 { margin: 0; line-height: 1.2; }
-      h1 { max-width: 860px; font-size: clamp(28px, 4vw, 42px); letter-spacing: -0.035em; }
+      h1 { max-width: 880px; font-size: clamp(28px, 4vw, 42px); letter-spacing: -0.035em; }
       h2 { font-size: 18px; margin-bottom: 12px; }
-      h3 { font-size: 14px; margin: 18px 0 8px; }
       p, li { line-height: 1.55; }
       .eyebrow { margin: 0 0 8px; color: #52616f; font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
       .meta { margin: 10px 0 0; color: #52616f; }
@@ -36,100 +35,94 @@
   <body>
     <main>
       <header>
-        <p class="eyebrow">instant-vfs · semantic layer</p>
-        <h1>One call answers "where is X?": gitvfs gets judgment from TypeSafe's Jev</h1>
-        <p class="meta">Branch <code>semantic-jev</code> · deployed to <code>gitvfs.miryaboy.workers.dev</code> · 203 tests green · 15/15 bench tasks on two models</p>
-        <div class="status">Bench: Sonnet 4.5 went from 11/15 at $0.42/task to 15/15 at $0.016/task, one tool call each</div>
+        <p class="eyebrow">instant-vfs · hybrid code search</p>
+        <h1>Every repo indexes itself in seconds: potion-code embeddings + BM25 in the Durable Object, Jev on top, dozens of repos per call</h1>
+        <p class="meta">Branch <code>hybrid-search</code> (on top of <code>semantic-jev</code>) · deployed to <code>gitvfs.miryaboy.workers.dev</code> · 220 tests green</p>
+        <div class="status">12 cold repos ingested, indexed, searched and reranked in one 2.9s call</div>
       </header>
       <div class="layout">
         <div>
           <section>
             <h2>What changed</h2>
-            <p>
-              gitvfs was fast and lexical: an agent still had to guess which of <code>/tree</code>, <code>/grep</code>, <code>/outline</code> and <code>/file</code> to call, and in which order. The April traces showed that this guessing, not the data, was where calls and tokens went. Now the guessing is done server-side by a decision model.
-            </p>
             <ul>
-              <li><code>/find?q=&lt;plain question&gt;</code> returns ranked <code>{path, symbol, line, endLine, probability, snippet, next}</code> plus <code>exists</code>, the probability the repo contains the answer at all. When the top hit is ≥ 0.8 its source is inlined, so most questions end here.</li>
-              <li><code>/ask?q=</code> is <code>/find</code> with the source always inlined; <code>/file/&lt;path&gt;?about=</code> (alias <code>/locate</code>) ranks lines inside one file; <code>/grep?intent=</code> orders matches by relevance; <code>/verify/&lt;path&gt;?lines=&amp;claim=</code> checks an answer against the source; <code>/tree?roles=1</code> tags every entry (entrypoint, core, tests, generated, …).</li>
-              <li>Answers are cached per <code>(sha, question)</code> inside the repo's Durable Object; a repeat question makes zero model calls. Every semantic response carries <code>x-gitvfs-jev-requests / -tokens / -ms</code>.</li>
-              <li>Two agent frictions found in the traces now return a <code>suggested</code> URL: unknown <code>/tree</code> params (Jev picks the param you meant), bracketed <code>[@ref]</code> pasted from the docs, and <code>?depth=1&amp;glob=&lt;dir&gt;</code>.</li>
+              <li><code>GET /&lt;owner&gt;/&lt;repo&gt;/search?q=</code> — hybrid code search. Symbol-aware chunks (one per outline symbol, 40-line windows elsewhere) are embedded with Minish Lab's <code>potion-code-16M-v2</code> and scored with BM25; the two lists are fused by reciprocal rank (the <a href="https://github.com/MinishLab/semble">semble</a> recipe), then Jev reranks the top 30 and adds <code>relevance</code>. <code>&amp;classify=a,b,c</code> labels every hit, <code>&amp;type=code|docs</code> restricts, <code>&amp;glob=</code> scopes, <code>&amp;rerank=0</code> is pure retrieval.</li>
+              <li><code>GET /search?q=&amp;repos=o/a,o/b@ref,…</code> (base URL, up to 20 repos) — each repo is resolved, ingested and indexed concurrently, per-repo tops are merged, reranked together, and diversified (≤2 hits per file, no repo takes more than half the slots). Repos still warming are listed under <code>pending</code>.</li>
+              <li><strong>Embedding runs in the Worker.</strong> <code>src/embed.ts</code> is a dependency-free port of Model2Vec inference (BERT WordPiece → mean pool → L2 norm), pinned to the Python reference token-for-token by <code>test/embed.test.ts</code>. Weights are a 17MB int8 export (<code>bench/export-model.py</code>, cosine 0.9999 to fp16) in R2, loaded once per isolate.</li>
+              <li><strong>Every repo indexes itself.</strong> After ingest the DO schedules an alarm that builds the index in 20s slices (hono ≈1s, vite ≈3s, react 41k chunks ≈6s). <code>/find</code> folds the top hybrid hits in as candidates whenever the index is ready.</li>
+              <li>Translated docs collapse onto one page; prose is down-weighted 0.8× against code; tests, fixtures, <code>.d.ts</code> and snapshots 0.7×.</li>
             </ul>
           </section>
           <section>
-            <h2>How /find works</h2>
+            <h2>Pipeline</h2>
             <pre class="mermaid">
 flowchart TD
-    Q["q: where is the body size limit enforced?"] --> P["path stage: one Choice over all paths<br/>(beam search over directory levels when &gt; 220 files)"]
-    Q --> G["grep stage: quoted strings + code-shaped tokens<br/>(bodyLimit, MAX_SIZE, src/foo.ts) → literal grep"]
-    P --> C["≤ 255 candidates: files, outline symbols, matched lines"]
-    G --> C
-    C --> J["one Jev request: Choice (best location) + Noul (exists)"]
-    J --> R["hits[] with probability, snippet, next URL<br/>+ source when top ≥ 0.8"]
+    I["ingest (tarball → SQLite)"] --> A["alarm +300ms: chunk + embed + BM25 terms<br/>int8 vectors in `chunks` table"]
+    Q["/search?q=…"] --> E["embed query (potion-code, in-Worker)"]
+    E --> D["cosine over in-memory int8 matrix"]
+    Q --> B["BM25 over identifier + camelCase parts"]
+    D --> F["RRF fusion + symbol / test / docs boosts<br/>≤2 per file, translations deduped"]
+    B --> F
+    F --> J["Jev: relevance per hit (+ classify labels)"]
+    J --> R["hits {path, start, end, symbol, score, relevance, snippet}"]
+    M["/search?repos=a,b,c…"] -->|fan-out| Q
+    M --> X["merge · rerank together · per-repo cap · pending list"]
             </pre>
-            <p>Code owns every step that is a lookup; the model is asked only the two questions that need judgment. Candidate sets are trimmed to the model's limits before asking, never after.</p>
-          </section>
-          <section>
-            <h2>Bug found on the way (AS-010)</h2>
-            <p>
-              The first <code>/find</code> on facebook/react returned 502: <code>LIKE or GLOB pattern too complex</code>. Workers' embedded SQLite caps LIKE/GLOB patterns at ~50 bytes, and every prefix-scoped query used <code>path LIKE 'prefix/%'</code>. Any <code>/tree/&lt;deep prefix&gt;</code> on a repo with long paths was already a 500. Prefix scoping is now a range on the primary key, grep's prefilter uses <code>instr()</code>, and long user globs are evaluated in JS.
-            </p>
           </section>
           <section class="note">
             <h2>Review focus</h2>
             <ul>
-              <li><code>src/semantic.ts</code> — question wording and candidate construction are the product; thresholds (0.8 auto-read, 0.06 beam cutoff) are explicit constants.</li>
-              <li><code>src/repo-do.ts</code> — the LIKE → range rewrite touches every prefix query; <code>test/bugs.test.ts</code> AS-010 covers tree, count, outline, grep and long globs on react.</li>
-              <li>Cost: a hono-sized repo is 4–5 Jev calls (~6k tokens) per new question; react is 6–9 calls (~15–37k). Cached thereafter.</li>
+              <li><code>src/embed.ts</code> — the tokenizer must stay byte-for-byte compatible with HF WordPiece; the test compares against <code>potion-ref.json</code> generated by model2vec.</li>
+              <li><code>src/repo-do.ts</code> — <code>ensureIndexed</code> is resumable and the alarm now multiplexes index slices with eviction; <code>index_pending</code> is the hand-off.</li>
+              <li><code>src/search-index.ts</code> — all ranking constants are explicit (RRF k=60, symbol ×1.15, docs ×0.8, tests ×0.7, symbol-like queries lexical 1.4×).</li>
+              <li>Memory: react's matrix is 41k×256 int8 ≈ 10MB per DO plus the 17MB model per isolate.</li>
             </ul>
           </section>
         </div>
         <div>
           <section>
-            <h2>Benchmark (2026-09-19, 15 tasks, one <code>http_get</code> tool)</h2>
+            <h2>Numbers</h2>
             <table>
-              <tr><th></th><th>Sonnet 4.5 baseline</th><th>+ gitvfs</th><th>minimax baseline</th><th>+ gitvfs</th></tr>
-              <tr><td>Pass rate</td><td>11/15</td><td><b>15/15</b></td><td>12/15</td><td><b>15/15</b></td></tr>
-              <tr><td>Mean tool calls</td><td>4.5</td><td><b>1.0</b></td><td>3.0</td><td><b>2.0</b></td></tr>
-              <tr><td>Mean input tokens</td><td>135,417</td><td><b>4,392</b></td><td>22,213</td><td><b>2,607</b></td></tr>
-              <tr><td>Mean cost / task</td><td>$0.416</td><td><b>$0.016</b></td><td>$0.0098</td><td><b>$0.0018</b></td></tr>
-              <tr><td>Mean wall-clock</td><td>20.2s</td><td><b>5.9s</b></td><td>28.4s</td><td><b>16.9s</b></td></tr>
+              <tr><th>Repo</th><th>Files</th><th>Chunks</th><th>Index build</th><th>Warm query</th></tr>
+              <tr><td>honojs/hono</td><td>477</td><td>3,469</td><td>0.8s</td><td>~40ms</td></tr>
+              <tr><td>vitejs/vite</td><td>2,716</td><td>8,175</td><td>~3s</td><td>~60ms</td></tr>
+              <tr><td>facebook/react</td><td>6,845</td><td>41,410</td><td>5.6s</td><td>~150ms</td></tr>
             </table>
-            <p>Tool calls labelled by classifier.dev (<code>bench/agents/classify-traces.ts</code>): baseline made 34 failed requests and 46 broad reads across 112 calls; gitvfs made 3 failed requests across 45.</p>
+            <p>Cross-repo: 12 cold HTTP/CLI libraries (ky, axios, got, node-fetch, hono, express, koa, fastify, commander, yargs, chalk, lodash) → one 2.9s call including all ingests and index builds; 1.6s warm with rerank, 0.9s with <code>type=code</code>.</p>
+            <p>Bench (T16–T18, "semantic-search" tasks; full run in <code>bench/agents/results/</code>): see the analysis note for the per-model table.</p>
           </section>
           <section>
             <h2>Example</h2>
-            <pre>$ curl --get gitvfs.miryaboy.workers.dev/honojs/hono/find \
-    --data-urlencode 'q=where is the request body size limit enforced'
+            <pre>$ curl --get gitvfs.miryaboy.workers.dev/search --data-urlencode \
+    'q=retry a failed request with exponential backoff' \
+    --data-urlencode 'repos=sindresorhus/ky,axios/axios,sindresorhus/got,…' \
+    --data-urlencode 'type=code'
 {
-  "exists": 0.98, "confidence": 0.99,
-  "hits": [{
-    "path": "src/middleware/body-limit/index.ts",
-    "kind": "symbol", "symbol": "bodyLimit", "line": 57,
-    "probability": 0.99,
-    "snippet": "57 | export const bodyLimit = (options: BodyLimitOptions) ...",
-    "next": "/honojs/hono@cf2d2b7…/file/src/middleware/body-limit/index.ts?lines=57-97"
-  }, …],
-  "source": { "path": "…/index.ts", "lines": "57-97", "text": "57 | export const bodyLimit …" }
-}
-x-gitvfs-jev-requests: 5   x-gitvfs-jev-tokens: 5269   x-gitvfs-jev-ms: 768</pre>
+  "repos": [{"repo":"sindresorhus/ky","sha":"0d59458…","chunks":1126,"hits":8}, …],
+  "hits": [
+    {"relevance":0.71,"repo":"sindresorhus/got","path":"source/core/calculate-retry-delay.ts","start":1,"end":42, …},
+    {"relevance":0.47,"repo":"sindresorhus/got","path":"source/core/index.ts","start":572,"symbol":"normalizeError", …},
+    {"relevance":0.27,"repo":"sindresorhus/ky","path":"source/core/constants.ts","symbol":"ForceRetryOptions", …}
+  ]
+}</pre>
           </section>
           <section>
             <h2>Files</h2>
             <ul>
-              <li><code>src/jev.ts</code> — TypeSafe client: retries on 429/529, per-response meter, Choice/Noul/Score types.</li>
-              <li><code>src/semantic.ts</code> — <code>planQuery</code>, <code>find</code>, <code>rerank</code>, <code>locate</code>, <code>roles</code>, <code>verify</code>, <code>meantParam</code> over a <code>Source</code> interface.</li>
-              <li><code>src/worker.ts</code> — routes <code>find</code>, <code>ask</code>, <code>locate</code>, <code>verify</code>; params <code>intent</code>, <code>about</code>, <code>roles</code>; error suggestions; llms.txt + landings.</li>
-              <li><code>src/repo-do.ts</code> — <code>semantic_cache</code> table, LIKE-free prefix scoping, JS glob fallback, <code>TYPESAFE_API_KEY</code> in <code>Env</code>.</li>
-              <li><code>test/semantic.test.ts</code> (15 tests), <code>test/bugs.test.ts</code> AS-010/AS-011 (9 tests), <code>docs/AGENT_STORIES.md</code>, <code>functionality.md</code>, <code>README.md</code>.</li>
-              <li><code>bench/agents/bench.ts</code> prompt, tasks T11–T15, <code>classify-traces.ts</code>, <code>semantic-try.ts</code> (local harness against the live lexical API), analysis under <code>bench/agents/analyses/</code>.</li>
+              <li><code>src/embed.ts</code> — Model2Vec inference port + int8 model loader.</li>
+              <li><code>src/search-index.ts</code> — chunking, BM25 terms, in-memory matrix, fusion, diversity.</li>
+              <li><code>src/repo-do.ts</code> — <code>chunks</code> table, <code>ensureIndexed</code>, <code>search</code>, background build via alarm.</li>
+              <li><code>src/worker.ts</code> — <code>/search</code> (per repo), <code>/search?repos=</code>, rerank/classify, <code>/find</code> integration, <code>/status.index</code>.</li>
+              <li><code>bench/export-model.py</code>, <code>wrangler.toml</code> (<code>MODELS</code> R2 bucket).</li>
+              <li>Tests: <code>test/embed.test.ts</code> (5), <code>test/search.test.ts</code> (12). Live tests now fail loudly on a 503 unless <code>GITVFS_ALLOW_UNAVAILABLE=1</code>.</li>
+              <li>Docs: llms.txt, both landings, README, <code>functionality.md</code>; bench prompt + tasks T16–T18.</li>
             </ul>
           </section>
           <section>
             <h2>Operational</h2>
             <ul>
-              <li>New secret <code>TYPESAFE_API_KEY</code> (set). Without it the semantic routes return <code>503 semantic_unavailable</code>; <code>?intent=</code> and <code>?roles=1</code> degrade to the lexical result with <code>x-gitvfs-semantic: unavailable</code>.</li>
-              <li>Semantic routes share the <code>/bash</code>+<code>/grep</code> per-IP limit (30/10s) and the per-SHA throttle.</li>
-              <li><code>GITVFS_INTERNAL_KEY</code> was rotated; the new value is in the local <code>.env</code> / <code>.dev.vars</code> (gitignored).</li>
+              <li>New R2 bucket <code>gitvfs-models</code> with <code>potion-code-16M-v2.m2v</code> (upload with <code>--remote</code>; wrangler 4 defaults to local, which is how the first deploy shipped with search silently unavailable).</li>
+              <li>Without the bucket: <code>503 search_unavailable</code>. Without the TypeSafe key: retrieval works, <code>ranked: false</code>.</li>
+              <li>Search shares the <code>/grep</code>+<code>/bash</code> per-IP limit; cross-repo calls count once.</li>
             </ul>
           </section>
         </div>

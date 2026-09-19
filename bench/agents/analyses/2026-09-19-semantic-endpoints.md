@@ -65,3 +65,43 @@ Per `/find` on hono (477 files): 4–5 Jev requests, ~5–8k tokens, 700–1300m
 
 - `exists` is calibrated in the right direction (0.14 for "default max size" in a file with no default; 0.44 for a count question) but has not been measured against a labelled set. A ~50-question set with known "not in this repo" answers would pin the threshold the docs currently give as 0.3.
 - Beam search spends most of its requests on directory levels for large repos. A single Choice over the top-2 levels flattened (≤255 entries) might halve it.
+
+---
+
+# Addendum — hybrid `/search` (potion-code-16M-v2 + BM25 + Jev), same day
+
+**Runs:** `2026-09-19T09-44-…` (minimax-m2.5 and claude-sonnet-4.5 on T16–T18 "semantic-search" tasks plus minimax on T11, T13, T14), after `/search`, `/search?repos=` and background indexing went live.
+
+## What was added
+
+- `src/embed.ts`: Model2Vec inference ported to the Worker (WordPiece → mean pool → L2), pinned to the Python reference by test. 17MB int8 weights in R2, cosine 0.9999 to fp16.
+- `src/search-index.ts` + DO: symbol-aware chunks, int8 vectors + BM25 term strings in SQLite, in-memory matrix, RRF fusion with semble-style boosts, ≤2 hits per file, translated docs deduped, `type=code|docs`.
+- `/search` per repo (Jev rerank + `classify=`), `/search?repos=` across up to 20 repos (merged, reranked, per-repo cap, `pending`), `/find` folds hybrid hits in, every ingest schedules a background index build via the DO alarm.
+
+## Index cost
+
+| Repo | Files | Chunks | Build | Warm query |
+|---|---:|---:|---:|---:|
+| honojs/hono | 477 | 3,469 | 0.8s | ~40ms |
+| vitejs/vite | 2,716 | 8,175 | ~3s | ~60ms |
+| facebook/react | 6,845 | 41,410 | 5.6s | ~150ms |
+
+12 cold repos through `/search?repos=`: 2.9s for the first call (all ingests + builds), 1.6s warm with rerank, 0.9s with `type=code`.
+
+## Bench on the search tasks
+
+| Task | Model | Baseline | gitvfs |
+|---|---|---|---|
+| T16 backoff computation (ky) | Sonnet 4.5 | pass, 3 calls, $0.184 | pass, 4 calls, $0.105 |
+| T17 parse-and-run method (commander) | Sonnet 4.5 | pass, 5 calls, $0.273 | pass, 2 calls, $0.027 |
+| T18 websocket upgrade file (hono) | Sonnet 4.5 | pass, 4 calls, $0.495 | pass, 1 call, $0.015 |
+| T16 | minimax | pass, 5 calls, $0.014 | pass, 4 calls, $0.004 |
+| T17 | minimax | fail (empty answer), 3 calls | fail (empty answer), 6 calls |
+| T18 | minimax | pass, 5 calls, $0.011 | pass, 1 call, $0.002 |
+
+T17 fails for minimax under both conditions with an empty final answer: the question ("the method that parses argv and then runs action handlers; the async variant returns a Promise") is one it cannot resolve into JSON, not a retrieval failure. T16 with gitvfs still took 4 calls for both models. minimax reached for `/find` with keyword-only queries ("backoff retry delay") and read two files; Sonnet called `/search` twice (the second time with the identifier it had just learned, `calculateDelay`), then `grep?intent=` and one `/file` slice to confirm. T18 with Sonnet is the shape everything should have: one `/search` call, answer read off the top hit. The gap on T16 is defensive verification of a correct first result, not retrieval.
+
+## Two things worth knowing
+
+- `wrangler r2 object put` defaults to **local** storage in wrangler 4. The first deploy shipped with the model missing from remote R2 and `/search` returning 503; the live tests skipped silently. They now fail unless `GITVFS_ALLOW_UNAVAILABLE=1`.
+- First search on a cold repo in the cross-repo call is bounded by the 4s/8s index budget per repo; anything larger shows up in `pending` with `filesIndexed/filesTotal` and finishes in the background.
