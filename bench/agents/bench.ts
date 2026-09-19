@@ -90,7 +90,13 @@ You have one tool: http_get(url). In addition to github.com, you have:
   https://gitvfs.miryaboy.workers.dev — an HTTP virtual filesystem for any public
   GitHub repo. Replace github.com with that host for machine-friendly output.
 
-Start with ONE semantic call — it usually answers the question outright:
+Start with ONE semantic call — it usually answers the question outright.
+(Brackets in the URL patterns below mean "optional": write /honojs/hono@abc123/find, never /honojs/hono[@abc123]/find.)
+  GET /<owner>/<repo>[@<ref>]/search?q=<what you are looking for, in plain language>
+      hybrid code search (embeddings + BM25) reranked by a judgment model;
+      hits {path, start, end, symbol, relevance, snippet}. Add &classify=a,b,c
+      to label each hit. For several repos at once:
+      GET /search?q=<query>&repos=<owner/a,owner/b>  (base URL, no owner/repo)
   GET /<owner>/<repo>[@<ref>]/find?q=<the question in plain language>
       returns ranked hits {path, symbol, line, endLine, probability, snippet, next}
       plus exists (P the repo has it). The snippet often already contains the

@@ -39,7 +39,11 @@ describe("semantic endpoints (live)", () => {
     await prewarm(HONO);
     const probe = await getJson(`/${HONO}/find?q=${enc("where is the bodyLimit middleware defined")}`);
     semanticAvailable = probe.status === 200;
-    if (!semanticAvailable) console.warn(`semantic endpoints unavailable (${probe.status}); skipping live tests`);
+    if (!semanticAvailable) {
+      const msg = `semantic endpoints unavailable (${probe.status}): ${JSON.stringify(probe.body).slice(0, 200)}`;
+      if (process.env.GITVFS_ALLOW_UNAVAILABLE !== "1") throw new Error(msg);
+      console.warn(msg);
+    }
   });
 
   it("/find locates a symbol from a plain question, with headers and a pinned next URL", async () => {

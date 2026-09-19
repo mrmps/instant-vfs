@@ -89,6 +89,34 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 - Integration-test `?roles=1` on hono root: `src/` is `core`, `.github/` is `ci`, `bun.lock` is `generated`.
 - Integration-test `/tree?subpath=x` returns `suggested`.
 
+## Hybrid Code Search (`/search`)
+
+`src/embed.ts` (Model2Vec inference port), `src/search-index.ts` (chunking, BM25, fusion), `src/repo-do.ts` (index table, incremental build, in-memory matrix), `src/worker.ts` (routes, Jev rerank/classify, cross-repo fan-out).
+
+### Existing Behavior
+
+- The embedding model is `minishlab/potion-code-16M-v2` (MIT), exported by `bench/export-model.py` to a 17MB int8 file in the `MODELS` R2 bucket and loaded once per isolate. Inference is BERT WordPiece (lowercase, accents stripped, punctuation isolated, `[UNK]` dropped) → mean of token vectors → L2 normalise; `test/embed.test.ts` pins it to the Python reference token-for-token.
+- Chunking is symbol-aware: every top-level outline symbol is a chunk (windows of 40 lines, stride 30, when longer than 60), gaps between symbols and files without an outline are windowed, empty files produce nothing. Each chunk embeds `path + symbol + code` (≤2400 chars) and stores an int8 vector plus a BM25 term string (identifiers and their camelCase/snake_case parts).
+- `ensureIndexed({budgetMs})` builds the `chunks` table in path order within a CPU budget and is resumable; `/search` uses a 15s budget and returns `202 indexing` with `filesIndexed/filesTotal` until ready. Status is on `/status` as `index`.
+- Every successful ingest schedules a background build: `ensureIngested` sets `meta.index_pending` and a DO alarm 300ms out; `alarm()` runs `ensureIndexed` in 20s slices, re-arming itself every 250ms until the index is ready, then restores the eviction alarm. A repo touched by any endpoint is therefore searchable a few seconds later without anyone calling `/search` (hono ≈1s, vite ≈3s, react ≈6s after ingest).
+- Retrieval: cosine over the in-memory matrix + BM25 (k1 1.2, b 0.75) fused by reciprocal rank (k=60); symbol-like queries weight BM25 1.4× and dense 0.6×; symbol chunks ×1.15, chunks whose symbol contains a query term ×1.2, test/fixture/`.d.ts`/snapshot paths ×0.7.
+- `GET /:owner/:repo[@:ref]/search?q=&k=&glob=&lines=&rerank=&classify=&format=text` returns `{sha, q, count, chunks, ranked, hits[{path, start, end, symbol, kind, score, dense, bm25, snippet, relevance?, label?, labelConfidence?}]}`. By default the top 30 are reranked by Jev (one Noul each) and `relevance` is added; `classify=a,b,…` (2–20 labels) adds one Choice per hit. `rerank=0` skips the model. Results are cached per `(sha, query, params)`.
+- `GET /search?q=&repos=o/a,o/b@ref,…` (1–20 repos, base URL) resolves, ingests and indexes each repo concurrently (4s budget each above 5 repos, 8s otherwise), merges the per-repo top hits, reranks the union with Jev, and returns `hits` (each with `repo` and `sha`), a `repos` summary, and `pending` for repos not yet ready (`202` only when nothing is ready).
+- `/find` folds the top 12 hybrid hits in as candidates when the index is already built; it never triggers a build.
+- Headers: `x-gitvfs-chunks`, the `x-gitvfs-jev-*` set, `x-gitvfs-semantic-cache`, and `x-gitvfs-semantic: unavailable|failed` when the model pass could not run (retrieval still returned).
+
+### Rules And Constraints
+
+- `/search` shares the `RL_EXPENSIVE` per-IP limit. Queries ≤600 chars, `k` ≤50, snippet `lines` ≤80.
+- Without `MODELS`: `503 search_unavailable`. Without `TYPESAFE_API_KEY`: retrieval works, `ranked: false`, header `x-gitvfs-semantic: unavailable`.
+- Files over 400KB are indexed by their first 400KB only. Index rows are evicted with the repo on the DO alarm.
+- The in-memory matrix is per DO instance (react: 41k × 256 int8 ≈ 10MB) and is rebuilt from SQLite after eviction or isolate restart (first query ~0.5s).
+
+### Testing Notes
+
+- Unit-test `chunkFile` (symbol coverage, windowing, empty), `bm25Terms`, term-string round trips, and the embedder against `potion-ref.json`.
+- Integration-test `/search` retrieval (`rerank=0`) on hono for the body-limit query, reranked relevance, `classify=` labels, `glob` scoping, `format=text`, `missing_q`, `/status.index`, and `/search?repos=` across two repos plus its `missing_repos`/`missing_q` validation.
+
 ## Agent Benchmark Harness
 
 `bench/agents/bench.ts` runs paired agent evaluations that compare normal GitHub access against gitvfs-assisted access.

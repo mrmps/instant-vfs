@@ -4,7 +4,8 @@ import { isFullSha, isShortSha, looksLikeTag } from "./github";
 import { outline, detectLanguage } from "./outline";
 import { normalizeGlob } from "./glob";
 import { resolveRefCached } from "./ref-cache";
-import { JevMeter, JevError } from "./jev";
+import { JevMeter, JevError, jev, jevAll, asNoul, asChoice, type Question } from "./jev";
+import type { SearchHit, IndexStatus } from "./repo-do";
 import {
   find as semanticFind, rerank as semanticRerank, locate as semanticLocate,
   roles as semanticRoles, verify as semanticVerify, meantParam, ROLES,
@@ -237,7 +238,7 @@ interface ParsedRepo {
 const ACTIONS = new Set([
   "tree", "tree.json", "file", "files", "stat", "grep", "status",
   "outline", "symbol", "count", "head", "bash",
-  "find", "ask", "locate", "verify",
+  "find", "ask", "locate", "verify", "search",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -262,7 +263,161 @@ function semanticSource(stub: DurableObjectStub<RepoDO>): SemanticSource {
       const r = await stub.grep(opts);
       return { files: r.files, matches: r.matches };
     },
+    async search(q, k) {
+      // Only when the index is already built: /find must not pay for a
+      // cold index build. /search does that and makes /find better after.
+      const st = await stub.indexStatus();
+      if (st.state !== "ready") return [];
+      const r = await stub.search(q, { k, snippetLines: 4 });
+      return r.hits.map((h) => ({ path: h.path, start: h.start, end: h.end, symbol: h.symbol, kind: h.kind, snippet: h.snippet }));
+    },
   };
+}
+// ---------------------------------------------------------------------------
+// Search plumbing: Jev rerank + classify over hybrid hits, and the cross-repo
+// fan-out used by GET /search?repos=.
+// ---------------------------------------------------------------------------
+
+type RankedHit = SearchHit & { repo?: string; sha?: string; relevance?: number; label?: string; labelConfidence?: number };
+
+async function rerankHits(apiKey: string, meter: JevMeter, q: string, hits: RankedHit[], labels: string[] | null): Promise<RankedHit[]> {
+  if (!hits.length) return hits;
+  const subset = hits.slice(0, 60);
+  const state = subset.map((h, i) => `h${i}| ${h.repo ? h.repo + " " : ""}${h.path}:${h.start}-${h.end}${h.symbol ? ` (${h.symbol})` : ""}\n${h.snippet}`).join("\n\n");
+  const questions: Record<string, Question> = {};
+  subset.forEach((_, i) => {
+    questions[`r${i}`] = {
+      type: "noul",
+      instructions: `A developer searched code for: "${q}". Does result \`h${i}\` (path, lines and code shown) contain what they are looking for?`,
+      criteria: {
+        true: "This code is the thing asked about, or its definition / the decisive usage.",
+        false: "Unrelated, a test fixture, a passing mention, or only superficially similar.",
+      },
+    };
+    if (labels) {
+      questions[`c${i}`] = {
+        type: "choice",
+        instructions: `Which label best describes result \`h${i}\`?`,
+        criteria: Object.fromEntries(labels.map((l) => [l, null])),
+      };
+    }
+  });
+  const r = await jev(apiKey, state, questions, { meter });
+  return subset.map((h, i) => {
+    const c = labels ? asChoice(r.answers[`c${i}`]) : null;
+    return {
+      ...h,
+      relevance: Math.round((asNoul(r.answers[`r${i}`]) ?? 0) * 1000) / 1000,
+      ...(c ? { label: c.choice, labelConfidence: Math.round(c.confidence * 1000) / 1000 } : {}),
+    };
+  }).sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0) || b.score - a.score);
+}
+
+function parseType(url: URL): "code" | "docs" | "all" | Response {
+  const t = url.searchParams.get("type") ?? "all";
+  if (t === "code" || t === "docs" || t === "all") return t;
+  return err("bad_type", "?type= must be code, docs, or all.", 400);
+}
+
+// Cross-repo merge: no single repo may take more than half of the slots
+// when three or more repos answered, so one big repo cannot bury the rest.
+function diversify<H extends { repo?: string; path: string }>(hits: H[], k: number, repos: number): H[] {
+  const cap = repos >= 3 ? Math.max(2, Math.ceil(k / 2)) : k;
+  const perRepo = new Map<string, number>();
+  const out: H[] = [];
+  const deferred: H[] = [];
+  for (const h of hits) {
+    const n = perRepo.get(h.repo ?? "") ?? 0;
+    if (n >= cap) { deferred.push(h); continue; }
+    perRepo.set(h.repo ?? "", n + 1);
+    out.push(h);
+    if (out.length >= k) break;
+  }
+  return out.length >= k ? out : [...out, ...deferred].slice(0, k);
+}
+
+function parseLabels(url: URL): string[] | null {
+  const raw = url.searchParams.get("classify");
+  if (!raw) return null;
+  const labels = raw.split(",").map((l) => l.trim()).filter(Boolean);
+  return labels.length >= 2 && labels.length <= 20 ? labels : null;
+}
+
+// Get one repo to "searchable": resolve ref, ingest, build index within a
+// budget. Returns the stub + sha on success, or a status describing why not.
+async function prepareRepo(env: Env, ctx: ExecutionContext, spec: string, budgetMs: number): Promise<
+  | { ok: true; owner: string; repo: string; sha: string; stub: DurableObjectStub<RepoDO>; index: IndexStatus }
+  | { ok: false; repo: string; state: string; message: string; retryAfter?: number; index?: IndexStatus }
+> {
+  const m = spec.match(/^([\w.-]+)\/([\w.-]+?)(?:@([^/]+))?$/);
+  if (!m) return { ok: false, repo: spec, state: "bad_repo", message: "Expected owner/repo[@ref]." };
+  const [, owner, repo, ref] = m;
+  let sha: string;
+  try {
+    sha = ref && isFullSha(ref) ? ref : (await resolveRefCached(ctx, owner, repo, ref ?? "HEAD", env.GITHUB_TOKEN, {})).sha;
+  } catch (e: any) {
+    return { ok: false, repo: spec, state: "ref_not_found", message: e?.message ?? String(e) };
+  }
+  const stub = env.REPO.get(env.REPO.idFromName(`${owner}/${repo}@${sha}`));
+  let ingest;
+  try { ingest = await stub.ensureIngested(owner, repo, sha); } catch (e: any) {
+    return { ok: false, repo: spec, state: "ingest_too_large", message: e?.message ?? String(e), retryAfter: 5 };
+  }
+  if (ingest.state !== "ready") return { ok: false, repo: spec, state: ingest.state, message: ingest.error ?? `repo is ${ingest.state}`, retryAfter: 3 };
+  const index = await stub.ensureIndexed({ budgetMs });
+  if (index.state !== "ready") {
+    return { ok: false, repo: spec, state: index.state === "building" ? "indexing" : index.state, message: index.error ?? `index is ${index.state} (${index.filesIndexed}/${index.filesTotal} files)`, retryAfter: 3, index };
+  }
+  return { ok: true, owner, repo, sha, stub, index };
+}
+
+// GET /search?q=&repos=a/b,c/d@ref&k=&rerank=&classify=
+async function handleMultiSearch(request: Request, env: Env, ctx: ExecutionContext, url: URL, internalBypass: boolean): Promise<Response> {
+  const q = url.searchParams.get("q");
+  if (!q || !q.trim()) return err("missing_q", "Missing ?q=<query>.", 400);
+  const repos = (url.searchParams.get("repos") ?? "").split(",").map((r) => r.trim()).filter(Boolean);
+  if (!repos.length) return err("missing_repos", "Missing ?repos=owner/a,owner/b[@ref] (1–20 repos). For one repo use /<owner>/<repo>/search?q=.", 400);
+  if (repos.length > 20) return err("too_many_repos", "At most 20 repos per call.", 400);
+  if (!internalBypass) {
+    const ipBlock = await rateLimit(env.RL_EXPENSIVE, clientIp(request), "search");
+    if (ipBlock) return ipBlock;
+  }
+  const k = Math.max(1, Math.min(Number(url.searchParams.get("k") ?? "10") || 10, 50));
+  const type = parseType(url);
+  if (type instanceof Response) return type;
+  const perRepo = Math.max(3, Math.min(k, 15));
+  const budget = repos.length > 5 ? 4000 : 8000;
+  const prepared = await Promise.all(repos.map((r) => prepareRepo(env, ctx, r, budget)));
+  const results = await Promise.all(prepared.map(async (p) => {
+    if (!p.ok) return { spec: p.repo, pending: p, hits: [] as RankedHit[], chunks: 0 };
+    const r = await p.stub.search(q, { k: perRepo, snippetLines: 8, type });
+    const spec = `${p.owner}/${p.repo}`;
+    return { spec, sha: p.sha, chunks: r.chunks, hits: r.hits.map((h) => ({ ...h, repo: spec, sha: p.sha })) };
+  }));
+  const readyRepos = results.filter((r) => !("pending" in r && r.pending)).length;
+  let hits: RankedHit[] = results.flatMap((r) => r.hits).sort((a, b) => b.score - a.score);
+  const meter = new JevMeter();
+  const headers: Record<string, string> = { "cache-control": "no-store" };
+  const labels = parseLabels(url);
+  const wantRerank = url.searchParams.get("rerank") !== "0";
+  if ((wantRerank || labels) && hits.length && env.TYPESAFE_API_KEY) {
+    try { hits = await rerankHits(env.TYPESAFE_API_KEY, meter, q, hits, labels); Object.assign(headers, meter.headers()); }
+    catch { headers["x-gitvfs-semantic"] = "failed"; }
+  } else if ((wantRerank || labels) && !env.TYPESAFE_API_KEY) {
+    headers["x-gitvfs-semantic"] = "unavailable";
+  }
+  const pending = results.filter((r) => "pending" in r && r.pending).map((r) => {
+    const p = (r as any).pending;
+    return { repo: p.repo, state: p.state, message: p.message, ...(p.index ? { filesIndexed: p.index.filesIndexed, filesTotal: p.index.filesTotal } : {}) };
+  });
+  const body = {
+    q,
+    repos: results.map((r) => ("pending" in r && r.pending) ? { repo: r.spec, state: (r as any).pending.state } : { repo: r.spec, sha: (r as any).sha, chunks: r.chunks, hits: r.hits.length }),
+    ...(pending.length ? { pending, hint: "Some repos are still ingesting or indexing. Retry in a few seconds; results below cover the ready ones." } : {}),
+    count: Math.min(k, hits.length),
+    hits: diversify(hits, k, readyRepos),
+  };
+  return json(body, pending.length && !hits.length ? 202 : 200, pending.length ? { ...headers, "retry-after": "3" } : headers);
 }
 
 function semanticUnavailable(): Response {
@@ -382,6 +537,11 @@ paraphrase source code instead of returning it. Every response carries
 x-gitvfs-sha / x-gitvfs-ref / x-gitvfs-resolved-at headers for freshness.
 
 Start with one semantic call, then read only what it points at:
+- Code search in plain language, one or many repos → /search?q=<query>
+  (hybrid: potion-code embeddings + BM25 over symbol-aware chunks, reranked by
+  Jev). Add &classify=a,b,c to label every hit. Cross-repo:
+  GET /search?q=<query>&repos=owner/a,owner/b@ref,… (up to 20) merges and
+  reranks results across repositories in one call.
 - "Where is X?" / "which file does Y?" / "what is the value of Z?" → /find?q=<plain question>
   One call returns ranked {path, symbol, line, endLine, probability, snippet, next}
   plus 'exists' (P that the repo has it at all). /ask?q= is the same plus the
@@ -410,6 +570,8 @@ Lexical endpoints when you already know what you want:
 ## Endpoints
 
 Semantic (judgment by TypeSafe's Jev; every response carries x-gitvfs-jev-* cost headers):
+- GET /search?q=<query>&k=10&glob=&type=code&classify=a,b&rerank=0  hybrid code search (embeddings + BM25) + Jev rerank
+- GET /search?q=<query>&repos=o/a,o/b@ref                    same across up to 20 repos, merged + reranked (base URL, no owner/repo)
 - GET /find?q=<question>&limit=5&read=1                     ranked locations + exists + snippets
 - GET /ask?q=<question>                                      /find with the top hit's source inlined
 - GET /grep?q=<pat>&intent=<question>                        grep, ordered by relevance to intent
@@ -454,6 +616,7 @@ x-gitvfs-semantic-cache hit | miss — answers are cached per (sha, question)
 x-gitvfs-exists        (/find) P(the repo contains what was asked for)
 x-gitvfs-confidence    (/find) top hit's probability
 x-gitvfs-verdict       (/verify) supported | contradicted | unrelated
+x-gitvfs-chunks        (/search) indexed chunks in this commit
 
 ## Caching
 
@@ -471,6 +634,9 @@ x-gitvfs-verdict       (/verify) supported | contradicted | unrelated
 
 ## Examples
 
+curl --get ${host}/honojs/hono/search --data-urlencode 'q=reject requests whose body is too large'
+curl --get ${host}/search --data-urlencode 'q=retry with exponential backoff' --data-urlencode 'repos=sindresorhus/ky,axios/axios,sindresorhus/got'
+curl --get ${host}/honojs/hono/search --data-urlencode 'q=jwt verification' --data-urlencode 'classify=definition,usage,test,docs'
 curl --get ${host}/honojs/hono/find --data-urlencode 'q=where is the request body size limit enforced'
 curl --get ${host}/honojs/hono/ask --data-urlencode 'q=what is the version in package.json'
 curl --get ${host}/honojs/hono/file/src/middleware/body-limit/index.ts --data-urlencode 'about=what happens when the body is too large'
@@ -498,7 +664,7 @@ function landingHtml(host: string): string {
   const hostForScript = JSON.stringify(host).replace(/</g, "\\u003c");
   const initialPrompt = `Use gitvfs to inspect [paste a public GitHub repository URL].
 
-First read ${host}/llms.txt for the complete API. Ask /find?q=<plain question> (or /ask?q= to get the source too) to locate what you need in one call, then read only that with /file?lines=A-B. Use /grep?intent=, /file?about= and /verify to search with purpose and check your answer. Resolve /head and pin the full SHA when the answer must be reproducible.
+First read ${host}/llms.txt for the complete API. Ask /search?q=<query> (hybrid code search, add &classify= to label hits, or /search?q=&repos=a/b,c/d at the base URL for many repos) or /find?q=<plain question> (or /ask?q= to get the source too) to locate what you need in one call, then read only that with /file?lines=A-B. Use /grep?intent=, /file?about= and /verify to search with purpose and check your answer. Resolve /head and pin the full SHA when the answer must be reproducible.
 
 Answer this request with evidence from the repository: [describe what you want to know]`;
 
@@ -706,7 +872,7 @@ Answer this request with evidence from the repository: [describe what you want t
         const vfsRepo = slug ? base + "/" + slug : base + "/OWNER/REPO";
         return "Use gitvfs to inspect " + githubRepo + ".\\n\\n" +
           "First read " + base + "/llms.txt for the complete API. Then use " + vfsRepo +
-          "/find?q=<plain question> (or /ask?q= to get the source too) to locate what you need in one call, then read only that with /file?lines=A-B. Use /grep?intent=, /file?about= and /verify to search with purpose and check your answer. Resolve " +
+          "/search?q=<query> (hybrid code search; &classify= labels hits; " + base + "/search?q=&repos=a/b,c/d for many repos) or /find?q=<plain question> (or /ask?q= to get the source too) to locate what you need in one call, then read only that with /file?lines=A-B. Use /grep?intent=, /file?about= and /verify to search with purpose and check your answer. Resolve " +
           vfsRepo + "/head and pin the full SHA when the answer must be reproducible.\\n\\n" +
           "Answer this request with evidence from the repository: [describe what you want to know]";
       }
@@ -787,6 +953,25 @@ For agents
     · any agent pipeline             → curl, always
 
 Endpoints — semantic (one call instead of a search loop)
+
+  GET /:owner/:repo[@:ref]/search?q=<query>
+       &k=10                                 results (max 50)
+       &glob=src/**/*.ts                     scope
+       &classify=definition,usage,test       label every hit (2–20 labels)
+       &type=code|docs                       only source, or only prose (default: all)
+       &rerank=0                             pure retrieval, no model pass
+       &lines=12                             snippet lines per hit
+    Hybrid code search: minishlab/potion-code-16M-v2 static embeddings +
+    BM25 over symbol-aware chunks, reciprocal-rank fused (the semble recipe),
+    then reranked by Jev with a 'relevance' per hit. The index is built in
+    the background right after a commit is first ingested (hono: 1s,
+    react: 6s) and answers in ~150ms warm; a /search that arrives before it
+    is ready finishes the build itself or returns 202 'indexing' with progress.
+
+  GET /search?q=<query>&repos=o/a,o/b@ref,…   (base URL, no owner/repo)
+    The same across up to 20 repositories at once: each is ingested and
+    indexed as needed, results are merged and reranked together. Repos
+    still warming up are listed under 'pending'; retry in a few seconds.
 
   GET /:owner/:repo[@:ref]/find?q=<question>
        &limit=5                              ranked hits to return
@@ -902,6 +1087,8 @@ Response metadata (headers on every response)
 Examples
 
   # semantic: one call, ranked answer, ready-to-read next URL
+  curl --get ${host}/honojs/hono/search --data-urlencode 'q=reject requests whose body is too large'
+  curl --get ${host}/search --data-urlencode 'q=retry with exponential backoff' --data-urlencode 'repos=sindresorhus/ky,axios/axios'
   curl --get ${host}/honojs/hono/find --data-urlencode 'q=where is the request body size limit enforced'
   curl --get ${host}/honojs/hono/ask --data-urlencode 'q=what is the version in package.json'
   curl --get ${host}/facebook/react/grep --data-urlencode 'q=useState' --data-urlencode 'intent=where is useState defined'
@@ -1740,6 +1927,7 @@ async function handle(
       return text(llmsTxt(url.origin));
     }
     if (pathname === "/popular") return handlePopular(env, url);
+    if (pathname === "/search") return handleMultiSearch(request, env, ctx, url, internalBypass);
     if (pathname === "/admin" || pathname === "/admin/") {
       return new Response(null, { status: 302, headers: { location: "/admin/dashboard" } });
     }
@@ -1855,7 +2043,8 @@ async function handle(
 
     if (action === "status") {
       const s = await stub.status();
-      return json({ owner, repo, sha, ref: ref ?? null, resolvedAt, ageSeconds, ...s });
+      const index = await stub.indexStatus();
+      return json({ owner, repo, sha, ref: ref ?? null, resolvedAt, ageSeconds, ...s, index });
     }
 
     // Kick off (or wait for) ingest. This can fail on very large repos (Worker CPU cap).
@@ -2770,6 +2959,79 @@ async function handle(
     // "does the repo contain this at all". Every hit carries a probability
     // and a ready-to-fetch `next` URL.
     // -----------------------------------------------------------------
+    // -----------------------------------------------------------------
+    // search — hybrid code search (potion-code-16M-v2 embeddings + BM25,
+    // fused like semble) over symbol-aware chunks, reranked by Jev.
+    //
+    //   GET /:owner/:repo[@:ref]/search?q=<query>
+    //       &k=10             results (max 50)
+    //       &glob=src/**/*.ts scope
+    //       &rerank=0         skip the Jev relevance pass (pure retrieval)
+    //       &classify=a,b,c   also label each hit with one of these
+    //       &type=code|docs   restrict to source or to prose (default all,
+    //                         prose slightly down-weighted, ≤2 hits per file,
+    //                         translated doc copies collapsed)
+    //       &lines=12         snippet lines per hit (max 80)
+    // First call on a commit builds the index (≈0.5–20s depending on size);
+    // 202 `indexing` with progress until it is ready.
+    // -----------------------------------------------------------------
+    if (action === "search") {
+      const q = url.searchParams.get("q");
+      if (q === null || q.trim() === "") return err("missing_q", "Missing ?q=<query>. Example: /search?q=retry with exponential backoff", 400);
+      if (q.length > 600) return err("bad_q", "Query too long (max 600 chars).", 400);
+      if (!env.MODELS) return err("search_unavailable", "This deployment has no embedding model bound (MODELS R2 bucket).", 503, {}, { "retry-after": "60" });
+      if (!internalBypass) {
+        const ipBlock = await rateLimit(env.RL_EXPENSIVE, clientIp(request), "search");
+        if (ipBlock) return ipBlock;
+      }
+      const index = await stub.ensureIndexed({ budgetMs: 15_000 });
+      if (index.state === "unavailable" || index.state === "error") {
+        return err("search_unavailable", index.error ?? "index unavailable", 503, { index }, { "retry-after": "30" });
+      }
+      if (index.state !== "ready") {
+        return err("indexing", `Building the search index: ${index.filesIndexed}/${index.filesTotal} files, ${index.chunks} chunks so far. Retry in a few seconds.`, 202, { sha, index }, { "retry-after": "3" });
+      }
+      const k = Math.max(1, Math.min(Number(url.searchParams.get("k") ?? "10") || 10, 50));
+      const rawGlob = url.searchParams.get("glob");
+      const glob = rawGlob ? normalizeGlob(rawGlob) : undefined;
+      const snippetLines = Math.max(1, Math.min(Number(url.searchParams.get("lines") ?? "12") || 12, 80));
+      const labels = parseLabels(url);
+      const type = parseType(url);
+      if (type instanceof Response) return type;
+      const wantRerank = url.searchParams.get("rerank") !== "0";
+      const meter = new JevMeter();
+      const key = `search|${q}|${k}|${glob ?? ""}|${snippetLines}|${wantRerank}|${labels?.join(",") ?? ""}|${type}`;
+      try {
+        const { value, cached } = await semanticCached(stub, key, async () => {
+          const r = await stub.search(q, { k: (wantRerank || labels) ? Math.max(k, 30) : k, glob, snippetLines, type });
+          let hits: RankedHit[] = r.hits;
+          let semantic: string | undefined;
+          if ((wantRerank || labels) && hits.length) {
+            if (!env.TYPESAFE_API_KEY) semantic = "unavailable";
+            else {
+              try { hits = await rerankHits(env.TYPESAFE_API_KEY, meter, q, hits, labels); }
+              catch { semantic = "failed"; }
+            }
+          }
+          return { chunks: r.chunks, retrievalMs: r.ms, semantic, hits: hits.slice(0, k) };
+        });
+        const h: Record<string, string> = { ...metaHeaders, ...meter.headers(), "x-gitvfs-semantic-cache": cached ? "hit" : "miss", "x-gitvfs-chunks": String(value.chunks) };
+        if (value.semantic) h["x-gitvfs-semantic"] = value.semantic;
+        if (url.searchParams.get("format") === "text") {
+          const body = value.hits.map((x) => `${x.relevance !== undefined ? x.relevance.toFixed(2) + "\t" : ""}${x.path}:${x.start}-${x.end}${x.symbol ? "\t" + x.symbol : ""}${x.label ? "\t" + x.label : ""}`).join("\n");
+          return finalize(text(body + (value.hits.length ? "\n" : ""), 200, h));
+        }
+        return finalize(json({
+          sha, q, count: value.hits.length, chunks: value.chunks,
+          ...(labels ? { labels } : {}),
+          ranked: wantRerank && !value.semantic,
+          hits: value.hits,
+        }, 200, h));
+      } catch (e) {
+        return semanticFailed(e);
+      }
+    }
+
     if (action === "find" || action === "ask") {
       const q = url.searchParams.get("q");
       if (q === null || q.trim() === "") {

@@ -3,6 +3,8 @@ import { parseTar } from "./tar";
 import { shouldSkip, mimeFor } from "./mime";
 import { outline, detectLanguage, type OutlineItem } from "./outline";
 import { runBash, type BashResult, type BashVfs } from "./bash";
+import { loadModel, MODEL_KEY, type EmbedModel } from "./embed";
+import { chunkFile, embedChunk, SearchMatrix, type IndexRow } from "./search-index";
 
 function countLinesBytes(bytes: Uint8Array): number {
   let n = 0;
@@ -67,6 +69,11 @@ const STALE_INGEST_MS = 3 * 60 * 1000;
 // it wipes its own rows. Storage is bounded by the working-set size of the
 // last N days' traffic, not by cumulative unique SHAs ever seen.
 const EVICTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Background index build: kicked off this long after ingest, in slices of
+// this much wall-clock per alarm invocation.
+const INDEX_KICKOFF_DELAY_MS = 300;
+const INDEX_SLICE_MS = 20_000;
 
 // Upper bound on how often we re-arm the alarm. Every read "touches" the
 // alarm but we only write storage at most once per hour per DO.
@@ -135,6 +142,32 @@ export interface Env {
   // those endpoints return 503 semantic_unavailable and the lexical ones
   // behave exactly as before.
   TYPESAFE_API_KEY?: string;
+  // R2 bucket holding the embedding model (see wrangler.toml [[r2_buckets]]).
+  // Without it /search returns 503 search_unavailable.
+  MODELS?: R2Bucket;
+}
+
+export interface IndexStatus {
+  state: "unavailable" | "building" | "ready" | "error";
+  sha?: string;
+  chunks: number;
+  filesIndexed: number;
+  filesTotal: number;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+}
+
+export interface SearchHit {
+  path: string;
+  start: number;
+  end: number;
+  symbol: string | null;
+  kind: string;
+  score: number;
+  dense: number;
+  bm25: number;
+  snippet: string;
 }
 
 interface IngestStatus {
@@ -191,6 +224,146 @@ export class RepoDO extends DurableObject<Env> {
     // Semantic answers are a pure function of (sha, question); this DO is
     // one sha, so cache them here. Evicted with everything else on alarm.
     this.sql.exec("CREATE TABLE IF NOT EXISTS semantic_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)");
+    // Hybrid search index: one row per chunk with its int8 embedding and
+    // BM25 term string. Built incrementally by ensureIndexed().
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL,
+        start INTEGER NOT NULL,
+        end INTEGER NOT NULL,
+        symbol TEXT,
+        kind TEXT NOT NULL,
+        terms TEXT NOT NULL,
+        scale REAL NOT NULL,
+        vec BLOB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
+    `);
+  }
+
+  // ------------------------------------------------------------------
+  // Hybrid search index (src/search-index.ts)
+  // ------------------------------------------------------------------
+
+  private matrix: SearchMatrix | null = null;
+  private model(): Promise<EmbedModel> {
+    const bucket = this.env.MODELS;
+    if (!bucket) throw new Error("search_unavailable: no MODELS bucket bound");
+    return loadModel(async () => {
+      const obj = await bucket.get(MODEL_KEY);
+      if (!obj) throw new Error(`search_unavailable: ${MODEL_KEY} missing from R2`);
+      return obj.arrayBuffer();
+    });
+  }
+
+  indexStatus(): IndexStatus {
+    const raw = this.getMeta("index");
+    if (!raw) return { state: "unavailable", chunks: 0, filesIndexed: 0, filesTotal: this.readyFilesStored };
+    try { return JSON.parse(raw) as IndexStatus; } catch { return { state: "unavailable", chunks: 0, filesIndexed: 0, filesTotal: 0 }; }
+  }
+
+  // Build (or continue building) the index within a CPU budget. Resumable:
+  // progress is the number of files processed in path order. Returns the
+  // status; callers retry while state === "building".
+  async ensureIndexed(opts: { budgetMs?: number } = {}): Promise<IndexStatus> {
+    const budget = Math.max(500, Math.min(opts.budgetMs ?? 10_000, 25_000));
+    let st = this.indexStatus();
+    if (this.readySha === null) {
+      const cur = await this.status();
+      if (cur.state === "ready" && cur.sha) { this.readySha = cur.sha; this.readyFilesStored = cur.filesStored ?? 0; this.readyBytesStored = cur.bytesStored ?? 0; }
+    }
+    if (st.state === "ready" && st.sha === this.readySha) return st;
+    if (!this.env.MODELS) return { ...st, state: "unavailable", error: "no MODELS bucket bound" };
+    let model: EmbedModel;
+    try { model = await this.model(); } catch (e: any) {
+      return { state: "unavailable", chunks: 0, filesIndexed: 0, filesTotal: 0, error: e?.message ?? String(e) };
+    }
+    const filesTotal = [...this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM files")][0]?.n ?? 0;
+    if (st.state !== "building" || st.sha !== this.readySha) {
+      this.sql.exec("DELETE FROM chunks");
+      st = { state: "building", sha: this.readySha ?? undefined, chunks: 0, filesIndexed: 0, filesTotal, startedAt: Date.now() };
+      this.setMeta("index", JSON.stringify(st));
+      this.matrix = null;
+    }
+    const t0 = Date.now();
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const BATCH = 40;
+    while (st.filesIndexed < filesTotal && Date.now() - t0 < budget) {
+      const rows = [...this.sql.exec<{ path: string; content: ArrayBuffer; size: number }>(
+        "SELECT path, content, size FROM files ORDER BY path LIMIT ? OFFSET ?", BATCH, st.filesIndexed,
+      )];
+      if (!rows.length) break;
+      for (const r of rows) {
+        // Very large files are indexed only by their head: the tail of a
+        // 20k-line generated file is never what anyone is looking for.
+        const content = decoder.decode(r.size > 400_000 ? new Uint8Array(r.content).subarray(0, 400_000) : r.content);
+        for (const c of chunkFile(r.path, content)) {
+          const e = embedChunk(model, c);
+          this.sql.exec(
+            "INSERT INTO chunks (path, start, end, symbol, kind, terms, scale, vec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            c.path, c.start, c.end, c.symbol ?? null, c.kind, e.terms, e.scale, e.q.buffer,
+          );
+          st.chunks++;
+        }
+        st.filesIndexed++;
+        if (Date.now() - t0 >= budget) break;
+      }
+      this.setMeta("index", JSON.stringify(st));
+    }
+    if (st.filesIndexed >= filesTotal) {
+      st.state = "ready";
+      st.finishedAt = Date.now();
+      this.setMeta("index", JSON.stringify(st));
+      this.matrix = null;
+    }
+    return st;
+  }
+
+  private async loadMatrix(): Promise<SearchMatrix> {
+    if (this.matrix) return this.matrix;
+    const model = await this.model();
+    const rows: IndexRow[] = [];
+    const vecs: Int8Array[] = [];
+    for (const r of this.sql.exec<{ id: number; path: string; start: number; end: number; symbol: string | null; kind: string; terms: string; scale: number; vec: ArrayBuffer }>(
+      "SELECT id, path, start, end, symbol, kind, terms, scale, vec FROM chunks ORDER BY id",
+    )) {
+      rows.push({ id: r.id, path: r.path, start: r.start, end: r.end, symbol: r.symbol, kind: r.kind, terms: r.terms, scale: r.scale });
+      vecs.push(new Int8Array(r.vec));
+    }
+    const all = new Int8Array(rows.length * model.dim);
+    vecs.forEach((v, i) => all.set(v, i * model.dim));
+    this.matrix = new SearchMatrix(model.dim, rows, all);
+    return this.matrix;
+  }
+
+  async search(q: string, opts: { k?: number; glob?: string; prefix?: string; snippetLines?: number; perFile?: number; type?: "code" | "docs" | "all" } = {}): Promise<{ hits: SearchHit[]; chunks: number; ms: number }> {
+    const t0 = Date.now();
+    const st = this.indexStatus();
+    if (st.state !== "ready") return { hits: [], chunks: 0, ms: 0 };
+    const model = await this.model();
+    const m = await this.loadMatrix();
+    const globRe = opts.glob ? globToRegExp(opts.glob) : null;
+    const prefix = opts.prefix?.replace(/^\/+|\/+$/g, "");
+    const filter = (globRe || prefix)
+      ? (r: IndexRow) => (!globRe || globRe.test(r.path)) && (!prefix || r.path === prefix || r.path.startsWith(prefix + "/"))
+      : undefined;
+    const top = m.search(model, q, { k: opts.k, filter, perFile: opts.perFile, type: opts.type });
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const cache = new Map<string, string[]>();
+    const maxLines = Math.max(1, Math.min(opts.snippetLines ?? 12, 80));
+    const hits: SearchHit[] = top.map((r) => {
+      let lines = cache.get(r.path);
+      if (!lines) {
+        const f = [...this.sql.exec<{ content: ArrayBuffer }>("SELECT content FROM files WHERE path = ?", r.path)][0];
+        lines = f ? splitLogicalLines(decoder.decode(f.content)) : [];
+        cache.set(r.path, lines);
+      }
+      const end = Math.min(r.end, r.start + maxLines - 1);
+      const snippet = lines.slice(r.start - 1, end).map((L, i) => `${r.start + i} | ${L}`).join("\n");
+      return { path: r.path, start: r.start, end: r.end, symbol: r.symbol, kind: r.kind, score: r.score, dense: r.dense, bm25: r.bm25, snippet };
+    });
+    return { hits, chunks: m.rows.length, ms: Date.now() - t0 };
   }
 
   private getMeta(key: string): string | null {
@@ -252,6 +425,13 @@ export class RepoDO extends DurableObject<Env> {
         this.readyBytesStored = result.bytesStored ?? 0;
         // First successful ingest schedules the self-eviction alarm.
         this.touchAlarm();
+        // …and a background index build so /search and /find are warm by
+        // the time the agent asks its second question. The alarm handler
+        // resumes the build in slices and restores the eviction alarm.
+        if (this.env.MODELS) {
+          this.setMeta("index_pending", "1");
+          this.ctx.storage.setAlarm(Date.now() + INDEX_KICKOFF_DELAY_MS);
+        }
       }
       return result;
     });
@@ -818,6 +998,26 @@ export class RepoDO extends DurableObject<Env> {
    */
   async alarm(): Promise<void> {
     const s = await this.status();
+    // Background index build (see ensureIngested). Runs in slices so a
+    // huge repo never pins the alarm; each slice re-arms the alarm until
+    // the index is ready, then hands control back to eviction.
+    if (this.getMeta("index_pending") === "1" && s.state === "ready") {
+      if (this.readySha === null && s.sha) {
+        this.readySha = s.sha;
+        this.readyFilesStored = s.filesStored ?? 0;
+        this.readyBytesStored = s.bytesStored ?? 0;
+      }
+      let st: IndexStatus;
+      try { st = await this.ensureIndexed({ budgetMs: INDEX_SLICE_MS }); }
+      catch { st = { state: "error", chunks: 0, filesIndexed: 0, filesTotal: 0 }; }
+      if (st.state === "building") {
+        this.ctx.storage.setAlarm(Date.now() + 250);
+        return;
+      }
+      this.sql.exec("DELETE FROM meta WHERE key = ?", "index_pending");
+      this.ctx.storage.setAlarm(Date.now() + EVICTION_TTL_MS);
+      return;
+    }
     if (s.state === "ingesting") {
       // Don't evict mid-ingest — reschedule and let the in-flight attempt
       // (or the stale-ingest retry path) run to completion first.
@@ -826,6 +1026,9 @@ export class RepoDO extends DurableObject<Env> {
     }
     this.sql.exec("DELETE FROM files");
     this.sql.exec("DELETE FROM meta");
+    this.sql.exec("DELETE FROM semantic_cache");
+    this.sql.exec("DELETE FROM chunks");
+    this.matrix = null;
     this.readySha = null;
     this.readyFilesStored = 0;
     this.readyBytesStored = 0;
@@ -923,5 +1126,7 @@ export class RepoDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM files");
     this.sql.exec("DELETE FROM meta");
     this.sql.exec("DELETE FROM semantic_cache");
+    this.sql.exec("DELETE FROM chunks");
+    this.matrix = null;
   }
 }

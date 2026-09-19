@@ -37,6 +37,8 @@ Judgment comes from [TypeSafe's Jev](https://docs.typesafe.ai), a decision model
 
 | Endpoint | What it does |
 |---|---|
+| `GET /search?q=<query>` | Hybrid code search: [potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) static embeddings + BM25 over symbol-aware chunks, fused like [semble](https://github.com/MinishLab/semble), reranked by Jev (`relevance`). `&classify=a,b,c` labels every hit; `&glob=` scopes; `&rerank=0` is pure retrieval |
+| `GET /search?q=<query>&repos=o/a,o/b@ref` | The same across up to 20 repos in one call (base URL): merged, reranked, with `pending` for repos still warming |
 | `GET /find?q=<question>` | "Where is X?" → ranked `{path, symbol, line, endLine, probability, snippet, next}` + `exists`; `&read=1` inlines the top hit |
 | `GET /ask?q=<question>` | `/find?read=1`: the answer and its source in one call |
 | `GET /file/<path>?about=<question>` | Ranked lines inside one file + `exists` + a slice (`/locate/<path>?q=` is an alias) |
@@ -44,7 +46,7 @@ Judgment comes from [TypeSafe's Jev](https://docs.typesafe.ai), a decision model
 | `GET /verify/<path>?lines=A-B&claim=<text>` | `supported` / `contradicted` / `unrelated` with probabilities |
 | `GET /tree?depth=1&roles=1` | Each entry tagged `entrypoint`, `core`, `tests`, `docs`, `generated`, … |
 
-Semantic responses add `x-gitvfs-jev-requests`, `x-gitvfs-jev-tokens`, `x-gitvfs-jev-ms` and `x-gitvfs-semantic-cache`. `/find` adds `x-gitvfs-exists` and `x-gitvfs-confidence`; `/verify` adds `x-gitvfs-verdict`. Unknown query params on `/tree` now come back with a `suggested` URL. Without `TYPESAFE_API_KEY` the semantic endpoints return `503 semantic_unavailable` and everything lexical is unchanged.
+The search index is built inside the commit's Durable Object in the background right after ingest (hono: 0.8s for 3.5k chunks; facebook/react: 5.6s for 41k chunks) and answers in about 150ms warm. Embedding runs in the Worker itself: `src/embed.ts` is a dependency-free port of Model2Vec inference (WordPiece + mean pooling) over an int8 export of the model stored in R2 (`bench/export-model.py`). Semantic responses add `x-gitvfs-jev-requests`, `x-gitvfs-jev-tokens`, `x-gitvfs-jev-ms` and `x-gitvfs-semantic-cache`. `/find` adds `x-gitvfs-exists` and `x-gitvfs-confidence`; `/verify` adds `x-gitvfs-verdict`. Unknown query params on `/tree` now come back with a `suggested` URL. Without `TYPESAFE_API_KEY` the semantic endpoints return `503 semantic_unavailable` and everything lexical is unchanged.
 
 ```bash
 curl --get https://gitvfs.miryaboy.workers.dev/honojs/hono/find --data-urlencode 'q=where is the request body size limit enforced'
@@ -59,7 +61,7 @@ Use curl or any raw HTTP client. **Do NOT use summarizing fetchers** (Claude Cod
 
 Recommended exploration loop:
 
-1. `/find?q=<plain question>` — one call returns where it is, how sure we are, and the `next` URL to read
+1. `/search?q=<query>` (or `/find?q=<plain question>`) — one call returns where it is, how sure we are, and the `next` URL to read; `/search?q=&repos=` does it across many repos
 2. `/file/<path>?lines=A-B` — read just that (or skip this: `/ask?q=` inlines it)
 3. `/verify/<path>?lines=A-B&claim=<your answer>` — check before you answer
 4. Fall back to `/grep?intent=`, `/outline`, `/bash` when you already know the pattern
@@ -92,6 +94,7 @@ With `/find` in front, Sonnet answered every task in exactly one tool call: the 
 ## Operational
 
 - `GITHUB_TOKEN` secret: 5000 req/hr to GitHub API (vs 60 unauthenticated). Set via `wrangler secret put GITHUB_TOKEN`.
+- `MODELS` R2 bucket (`gitvfs-models`): holds `potion-code-16M-v2.m2v` (17MB int8). Export with `python bench/export-model.py minishlab/potion-code-16M-v2 potion-code-16M-v2.m2v`, upload with `wrangler r2 object put gitvfs-models/potion-code-16M-v2.m2v --file …` (add `--local` for `wrangler dev`). Without it `/search` returns `503 search_unavailable`.
 - `TYPESAFE_API_KEY` secret: powers the semantic endpoints (key from console.typesafe.ai). Set via `wrangler secret put TYPESAFE_API_KEY`; put it in `.dev.vars` for `wrangler dev` and `.env` for `bench/semantic-try.ts`.
 - `GITVFS_INTERNAL_KEY` secret: the `X-Gitvfs-Key` header bypasses per-IP rate limits for internal tooling (tests, bench, MCP wrapper).
 - Rate limits (per client IP): 30/10s on `/bash` + `/grep`, 100/10s on everything else. Returns 429 with `retry-after`.
@@ -104,7 +107,7 @@ With `/find` in front, Sonnet answered every task in exactly one tool call: the 
 
 ```bash
 bun install
-bun test                 # 130+ tests (local unit + live integration)
+bun test                 # 220 tests (local unit + live integration); semantic/search 503s fail unless GITVFS_ALLOW_UNAVAILABLE=1
 bun bench:worker         # end-to-end latency bench against deployed worker
 bun bench/semantic-try.ts tasks   # run every bench question through /find locally (needs TYPESAFE_API_KEY in .env)
 bunx wrangler dev        # local dev server
