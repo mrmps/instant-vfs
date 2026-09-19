@@ -51,6 +51,44 @@ This file is the living functional spec for `instant-vfs`. The code remains the 
 - Integration-test `/bash?format=text&cmd=touch%20x` returns `400` with `x-gitvfs-exit-code: 127`.
 - Integration-test a no-match `/bash` grep returns `422` with the empty-output footer and `x-gitvfs-exit-code: 1`.
 
+## Semantic Endpoints (TypeSafe Jev)
+
+`src/semantic.ts` adds judgment on top of the lexical VFS. `src/jev.ts` is the TypeSafe client. The worker adapts its Durable Object stub to the `Source` interface; `bench/semantic-try.ts` adapts the public HTTP API so the same code runs locally.
+
+### Existing Behavior
+
+- `GET /find?q=<question>` combines a path-name judgment (one Choice over all paths for repos ≤220 files, beam search over directory levels computed in memory otherwise), paths whose segments literally contain a question term, a literal grep of the question's quoted strings and code-shaped identifiers, and lines that contain two or more of its plain words, then outlines of the resulting files, into ≤255 candidates (`file`, `symbol`, or `match` kinds). One Choice ranks the candidates and one Noul (`exists`) says whether the repo plausibly contains the answer. When the top probability is below 0.75, the top three files (≤1200 lines each) are read line by line (`locate`) and the judgment is repeated with the best lines added (`stages.final.deepened`). Hits carry `probability`, a numbered `snippet`, and a ready `next` URL pinned to the SHA. The top hit's `source` (≤80 lines) is inlined automatically when its probability is ≥0.8; `?read=1` (or `/ask`) forces it (≤200 lines) and `?read=0` suppresses it. `?limit=` caps hits (max 20).
+- `GET /file/<path>?about=<question>` (alias `/locate/<path>?q=`) ranks lines inside one file: windows of 150 lines, one Choice over line ids and one Noul per window, at most 4000 lines scanned (`scanned` reports the range). Returns `hits`, `exists`, and a `slice` around the best line (`?context=`, default 3).
+- `GET /grep?q=&intent=<question>` reranks up to 160 matches with one Noul each (batched 80 per model call). Implies `context=2` and `symbols=1`. JSON adds `intent`, `ranked`, `rankedMatches`, `best`, and `relevance` per match; text format prefixes each line with the relevance. `files_only=1` with `intent` is `400 bad_params`.
+- `GET /verify/<path>?lines=A-B&claim=<text>` returns `supported` (Noul), `verdict` (`supported` | `contradicted` | `unrelated`), `confidence`, and `probabilities`. Max 400 lines and 1000-char claims.
+- `GET /tree[.json]?roles=1` tags each entry with one of the ROLES (entrypoint, core, api, ui, types, util, config, build, ci, tests, docs, examples, data, assets, generated, scripts) and `roleConfidence` (JSON) or a trailing tab column (text). Works on `?depth=1` and flat listings ≤400 entries (`400 too_many_entries` beyond).
+- `400 unknown_query_param` on `/tree` asks Jev which known param was meant and, when confident (≥0.5), includes `suggested`, a corrected URL.
+- Every semantic response carries `x-gitvfs-jev-requests`, `x-gitvfs-jev-tokens`, `x-gitvfs-jev-ms`, `x-gitvfs-jev-model`, and `x-gitvfs-semantic-cache` (`hit` | `miss`). `/find` adds `x-gitvfs-exists` and `x-gitvfs-confidence`; `/verify` adds `x-gitvfs-verdict`.
+- Answers are cached in the per-SHA Durable Object (`semantic_cache` table, keyed by endpoint + every input) and evicted with the repo; successful GETs are also edge-cached like every other route.
+
+### Rules And Constraints
+
+- Semantic routes share the `/bash` + `/grep` rate limits (`RL_EXPENSIVE`, 30/10s per IP) and the per-SHA throttle. Internal-key traffic skips the per-IP cap only.
+- Without `TYPESAFE_API_KEY`: `/find`, `/ask`, `/locate`, `/verify`, and `/file?about=` return `503 semantic_unavailable`; `?intent=` and `?roles=1` return the lexical result with `x-gitvfs-semantic: unavailable`. A model failure returns `502 semantic_upstream_failed` (`429` when the model rate-limits) for the dedicated routes and `x-gitvfs-semantic: failed` with the lexical result for the params.
+- Candidate sets are sized to Jev's limits (255 Choice options, ~30k state tokens); the code trims before asking, never after.
+- Probabilities are the model's own and are returned unmodified (rounded to 3 decimals); thresholds live in the caller.
+
+### Edge Cases
+
+- A `find` question with no code-shaped tokens still works from path names alone; a question whose tokens grep nothing still gets path candidates.
+- A grep hit on the same line as a symbol is folded into the symbol candidate.
+- `/find` on an empty repo returns `hits: []`, `exists: 0`.
+- `?about=` on a file longer than 4000 lines scans the first 4000 and reports it in `scanned`.
+
+### Testing Notes
+
+- Unit-test `planQuery` (quoted literals, camelCase, snake_case, file.ext, stopwords).
+- Integration-test `/find` on pinned `honojs/hono` and `sst/opencode` commits: expected path in the top hit, `exists` high, headers present, second call `x-gitvfs-semantic-cache: hit` with zero Jev requests.
+- Integration-test `/verify` with a true and a false claim on `package.json`.
+- Integration-test `?intent=` orders the definition line first for `bodyLimit`; `files_only=1&intent=` is 400.
+- Integration-test `?roles=1` on hono root: `src/` is `core`, `.github/` is `ci`, `bun.lock` is `generated`.
+- Integration-test `/tree?subpath=x` returns `suggested`.
+
 ## Agent Benchmark Harness
 
 `bench/agents/bench.ts` runs paired agent evaluations that compare normal GitHub access against gitvfs-assisted access.

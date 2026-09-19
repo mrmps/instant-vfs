@@ -90,7 +90,19 @@ You have one tool: http_get(url). In addition to github.com, you have:
   https://gitvfs.miryaboy.workers.dev — an HTTP virtual filesystem for any public
   GitHub repo. Replace github.com with that host for machine-friendly output.
 
-Core endpoints (see /llms.txt for the full catalog):
+Start with ONE semantic call — it usually answers the question outright:
+  GET /<owner>/<repo>[@<ref>]/find?q=<the question in plain language>
+      returns ranked hits {path, symbol, line, endLine, probability, snippet, next}
+      plus exists (P the repo has it). The snippet often already contains the
+      answer; otherwise fetch the hit's next URL.
+  GET /<owner>/<repo>[@<ref>]/ask?q=<question>
+      same as /find but also inlines the top hit's source (≤200 lines)
+  GET /<owner>/<repo>[@<ref>]/file/<path>?about=<question>
+      ranked lines inside one file + a slice around the best one
+  GET /<owner>/<repo>[@<ref>]/grep?q=<pat>&intent=<question>
+      grep whose matches are ordered by relevance to the intent (best first)
+
+Lexical endpoints (see /llms.txt for the full catalog):
   GET /<owner>/<repo>[@<ref>]/tree[/<subpath>]?depth=1&glob=<g>&count=1
       directory listing (one-level, globbed, or count-only)
   GET /<owner>/<repo>[@<ref>]/outline/<path>?depth=2
